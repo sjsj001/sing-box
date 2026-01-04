@@ -73,39 +73,6 @@ jobs:
           - { os: linux, arch: amd64, variant: glibc, naive: true }
           - { os: linux, arch: amd64, variant: musl, naive: true, debian: amd64, rpm: x86_64, pacman: x86_64, openwrt: "x86_64" }
 
-          - { os: linux, arch: arm64, variant: purego, naive: true }
-          - { os: linux, arch: arm64, variant: glibc, naive: true }
-          - { os: linux, arch: arm64, variant: musl, naive: true, debian: arm64, rpm: aarch64, pacman: aarch64, openwrt: "aarch64_cortex-a53 aarch64_cortex-a72 aarch64_cortex-a76 aarch64_generic" }
-
-          - { os: linux, arch: "386", go386: sse2 }
-          - { os: linux, arch: "386", variant: glibc, naive: true, go386: sse2 }
-          - { os: linux, arch: "386", variant: musl, naive: true, go386: sse2, debian: i386, rpm: i386, openwrt: "i386_pentium4" }
-
-          - { os: linux, arch: arm, goarm: "7" }
-          - { os: linux, arch: arm, variant: glibc, naive: true, goarm: "7" }
-          - { os: linux, arch: arm, variant: musl, naive: true, goarm: "7", debian: armhf, rpm: armv7hl, pacman: armv7hl, openwrt: "arm_cortex-a5_vfpv4 arm_cortex-a7_neon-vfpv4 arm_cortex-a7_vfpv4 arm_cortex-a8_vfpv3 arm_cortex-a9_neon arm_cortex-a9_vfpv3-d16 arm_cortex-a15_neon-vfpv4" }
-
-          - { os: linux, arch: "386", go386: softfloat, openwrt: "i386_pentium-mmx" }
-          - { os: linux, arch: arm, goarm: "5", openwrt: "arm_arm926ej-s arm_cortex-a7 arm_cortex-a9 arm_fa526 arm_xscale" }
-          - { os: linux, arch: arm, goarm: "6", debian: armel, rpm: armv6hl, openwrt: "arm_arm1176jzf-s_vfp" }
-          - { os: linux, arch: mips, gomips: softfloat, openwrt: "mips_24kc mips_4kec mips_mips32" }
-          - { os: linux, arch: mipsle, gomips: hardfloat, debian: mipsel, rpm: mipsel, openwrt: "mipsel_24kc_24kf" }
-          - { os: linux, arch: mipsle, gomips: softfloat, openwrt: "mipsel_24kc mipsel_74kc mipsel_mips32" }
-          - { os: linux, arch: mips64, gomips: softfloat, openwrt: "mips64_mips64r2 mips64_octeonplus" }
-          - { os: linux, arch: mips64le, gomips: hardfloat, debian: mips64el, rpm: mips64el }
-          - { os: linux, arch: mips64le, gomips: softfloat, openwrt: "mips64el_mips64r2" }
-          - { os: linux, arch: s390x, debian: s390x, rpm: s390x }
-          - { os: linux, arch: ppc64le, debian: ppc64el, rpm: ppc64le }
-          - { os: linux, arch: riscv64, debian: riscv64, rpm: riscv64, openwrt: "riscv64_generic" }
-          - { os: linux, arch: loong64, debian: loongarch64, rpm: loongarch64, openwrt: "loongarch64_generic" }
-
-          - { os: windows, arch: amd64, legacy_win7: true, legacy_name: "windows-7" }
-          - { os: windows, arch: "386", legacy_win7: true, legacy_name: "windows-7" }
-
-          - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
-          - { os: android, arch: arm, ndk: "armv7a-linux-androideabi23" }
-          - { os: android, arch: amd64, ndk: "x86_64-linux-android23" }
-          - { os: android, arch: "386", ndk: "i686-linux-android23" }
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -144,13 +111,54 @@ jobs:
         with:
           ndk-version: r28
           local-cache: true
+      - name: Rewrite CRONET_GO_VERSION to go branch
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          echo "go" > .github/CRONET_GO_VERSION
+          cat .github/CRONET_GO_VERSION
+      - name: Inject cronet-go pseudo version replace
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          VERSION=$(go list -m -f '{{.Version}}' github.com/sjsj001/cronet-go@go)
+          echo "Using cronet-go version: $VERSION"
+
+          cat >> go.mod <<EOF
+          replace github.com/sagernet/cronet-go => github.com/sjsj001/cronet-go $VERSION
+          replace github.com/sagernet/cronet-go/all => github.com/sjsj001/cronet-go/all $VERSION
+          replace github.com/sagernet/cronet-go/lib/android_386 => github.com/sjsj001/cronet-go/lib/android_386 $VERSION
+          replace github.com/sagernet/cronet-go/lib/android_amd64 => github.com/sjsj001/cronet-go/lib/android_amd64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/android_arm => github.com/sjsj001/cronet-go/lib/android_arm $VERSION
+          replace github.com/sagernet/cronet-go/lib/android_arm64 => github.com/sjsj001/cronet-go/lib/android_arm64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/darwin_amd64 => github.com/sjsj001/cronet-go/lib/darwin_amd64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/darwin_arm64 => github.com/sjsj001/cronet-go/lib/darwin_arm64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/ios_amd64_simulator => github.com/sjsj001/cronet-go/lib/ios_amd64_simulator $VERSION
+          replace github.com/sagernet/cronet-go/lib/ios_arm64 => github.com/sjsj001/cronet-go/lib/ios_arm64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/ios_arm64_simulator => github.com/sjsj001/cronet-go/lib/ios_arm64_simulator $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_386 => github.com/sjsj001/cronet-go/lib/linux_386 $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_386_musl => github.com/sjsj001/cronet-go/lib/linux_386_musl $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_amd64 => github.com/sjsj001/cronet-go/lib/linux_amd64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_amd64_musl => github.com/sjsj001/cronet-go/lib/linux_amd64_musl $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_arm => github.com/sjsj001/cronet-go/lib/linux_arm $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_arm64 => github.com/sjsj001/cronet-go/lib/linux_arm64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_arm64_musl => github.com/sjsj001/cronet-go/lib/linux_arm64_musl $VERSION
+          replace github.com/sagernet/cronet-go/lib/linux_arm_musl => github.com/sjsj001/cronet-go/lib/linux_arm_musl $VERSION
+          replace github.com/sagernet/cronet-go/lib/tvos_amd64_simulator => github.com/sjsj001/cronet-go/lib/tvos_amd64_simulator $VERSION
+          replace github.com/sagernet/cronet-go/lib/tvos_arm64 => github.com/sjsj001/cronet-go/lib/tvos_arm64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/tvos_arm64_simulator => github.com/sjsj001/cronet-go/lib/tvos_arm64_simulator $VERSION
+          replace github.com/sagernet/cronet-go/lib/windows_386 => github.com/sjsj001/cronet-go/lib/windows_386 $VERSION
+          replace github.com/sagernet/cronet-go/lib/windows_amd64 => github.com/sjsj001/cronet-go/lib/windows_amd64 $VERSION
+          replace github.com/sagernet/cronet-go/lib/windows_arm64 => github.com/sjsj001/cronet-go/lib/windows_arm64 $VERSION
+          EOF
+          go mod tidy
       - name: Clone cronet-go
         if: matrix.naive
         run: |
           set -xeuo pipefail
           CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
           git init ~/cronet-go
-          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go remote add origin https://github.com/sjsj001/cronet-go.git
           git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
           git -C ~/cronet-go submodule update --init --recursive --depth=1
