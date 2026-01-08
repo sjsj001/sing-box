@@ -566,7 +566,7 @@ jobs:
           path: "dist"
   build_android:
     name: Build Android
-    if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Android'
+    if: false # github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Android'
     runs-on: ubuntu-latest
     needs:
       - calculate_version
