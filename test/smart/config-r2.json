@@ -1,0 +1,48 @@
+{
+  "log": {
+    "level": "debug",
+    "output": "/root/smart-test/box5.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "local"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2084
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "A",
+      "routing_mark": 21
+    },
+    {
+      "type": "direct",
+      "tag": "B",
+      "routing_mark": 22
+    },
+    {
+      "type": "smart",
+      "tag": "smart",
+      "outbounds": ["A", "B"],
+      "preferred": ["A"],
+      "switch": { "dwell": "20s" },
+      "probe": { "sample_ttl": "20s" },
+      "cache_path": "/root/smart-test/smart-cache-r2.json"
+    }
+  ],
+  "route": {
+    "final": "smart",
+    "default_domain_resolver": "local"
+  }
+}

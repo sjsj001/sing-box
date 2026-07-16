@@ -103,6 +103,8 @@ func OutboundRegistry() *outbound.Registry {
 	group.RegisterSelector(registry)
 	group.RegisterURLTest(registry)
 	group.RegisterLoadBalance(registry)
+	group.RegisterSmart(registry)
+	group.RegisterFailover(registry)
 
 	socks.RegisterOutbound(registry)
 	http.RegisterOutbound(registry)

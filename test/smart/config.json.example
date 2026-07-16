@@ -1,0 +1,135 @@
+{
+  "log": {
+    "level": "debug",
+    "output": "/root/smart-test/box.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "google",
+        "server": "8.8.8.8"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "naive",
+      "tag": "hk-fwd",
+      "server": "127.0.0.1",
+      "server_port": 8443,
+      "username": "NAIVE_USER",
+      "password": "NAIVE_PASSWORD",
+      "insecure_concurrency": 4,
+      "udp_over_tcp": true,
+      "tls": { "enabled": true, "server_name": "hk-node.example.com" }
+    },
+    {
+      "type": "naive",
+      "tag": "hk-main",
+      "server": "hk-node.example.com",
+      "server_port": 443,
+      "username": "NAIVE_USER",
+      "password": "NAIVE_PASSWORD",
+      "insecure_concurrency": 4,
+      "udp_over_tcp": true,
+      "tls": { "enabled": true, "server_name": "hk-node.example.com" }
+    },
+    {
+      "type": "naive",
+      "tag": "us-main",
+      "server": "us-node.example.com",
+      "server_port": 443,
+      "username": "NAIVE_USER",
+      "password": "NAIVE_PASSWORD",
+      "insecure_concurrency": 4,
+      "udp_over_tcp": true,
+      "tls": { "enabled": true, "server_name": "us-node.example.com" }
+    },
+    {
+      "type": "naive",
+      "tag": "de-main",
+      "server": "de-node.example.com",
+      "server_port": 443,
+      "username": "NAIVE_USER",
+      "password": "NAIVE_PASSWORD",
+      "insecure_concurrency": 4,
+      "udp_over_tcp": true,
+      "tls": { "enabled": true, "server_name": "de-node.example.com" }
+    },
+    {
+      "type": "naive",
+      "tag": "sg-main",
+      "server": "sg-node.example.com",
+      "server_port": 443,
+      "username": "NAIVE_USER",
+      "password": "NAIVE_PASSWORD",
+      "insecure_concurrency": 4,
+      "udp_over_tcp": true,
+      "tls": { "enabled": true, "server_name": "sg-node.example.com" }
+    },
+    {
+      "type": "naive",
+      "tag": "jp-main",
+      "server": "jp-node.example.com",
+      "server_port": 443,
+      "username": "NAIVE_USER",
+      "password": "NAIVE_PASSWORD",
+      "insecure_concurrency": 4,
+      "udp_over_tcp": true,
+      "tls": { "enabled": true, "server_name": "jp-node.example.com" }
+    },
+    {
+      "type": "urltest",
+      "tag": "HK",
+      "outbounds": ["hk-fwd", "hk-main"],
+      "interval": "5s",
+      "fallback": { "enabled": true, "max_delay": "2s" }
+    },
+    {
+      "type": "urltest",
+      "tag": "US",
+      "outbounds": ["us-main"],
+      "interval": "1m"
+    },
+    {
+      "type": "urltest",
+      "tag": "DE",
+      "outbounds": ["de-main"],
+      "interval": "1m"
+    },
+    {
+      "type": "urltest",
+      "tag": "SG",
+      "outbounds": ["sg-main"],
+      "interval": "1m"
+    },
+    {
+      "type": "urltest",
+      "tag": "JP",
+      "outbounds": ["jp-main"],
+      "interval": "1m"
+    },
+    {
+      "type": "smart",
+      "tag": "smart",
+      "outbounds": ["HK", "US", "DE", "SG", "JP"],
+      "preferred": ["JP"],
+      "switch": { "dwell": "20s" },
+      "cache_path": "/root/smart-test/smart-cache.json"
+    }
+  ],
+  "route": {
+    "final": "smart",
+    "default_domain_resolver": "google"
+  }
+}

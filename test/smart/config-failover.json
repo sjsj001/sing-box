@@ -1,0 +1,45 @@
+{
+  "log": {
+    "level": "debug",
+    "output": "/root/smart-test/box3.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "local"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2082
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "A",
+      "routing_mark": 21
+    },
+    {
+      "type": "direct",
+      "tag": "B",
+      "routing_mark": 22
+    },
+    {
+      "type": "failover",
+      "tag": "fo",
+      "outbounds": ["A", "B"],
+      "hedge_delay": "1.5s"
+    }
+  ],
+  "route": {
+    "final": "fo",
+    "default_domain_resolver": "local"
+  }
+}
