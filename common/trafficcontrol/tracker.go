@@ -46,7 +46,7 @@ func (t TrackerMetadata) ConnectionDomain() string {
 
 func (t TrackerMetadata) Chains() []string {
 	chains := t.Chain
-	if t.OutboundType == C.TypeLoadBalance {
+	if t.OutboundType == C.TypeLoadBalance || t.OutboundType == C.TypeSmart {
 		realOutboundChain := t.Metadata.GetRealOutboundChain()
 		if len(realOutboundChain) > 0 && t.outboundManager != nil {
 			var subChain []string

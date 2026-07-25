@@ -22,3 +22,7 @@
 CLAUDE.md
 AGENTS.md
 /.claude/
+
+# Go workspace (per-developer; see go.work for why go.mod stays clean)
+go.work
+go.work.sum

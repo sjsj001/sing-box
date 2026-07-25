@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -24,6 +25,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
 	sHttp "github.com/sagernet/sing/protocol/http"
+	"github.com/sagernet/sing/service"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -42,6 +44,7 @@ type Inbound struct {
 	inbound.Adapter
 	ctx              context.Context
 	router           adapter.ConnectionRouterEx
+	dnsRouter        adapter.DNSRouter // resolves smart-probe targets the way real traffic resolves them
 	logger           logger.ContextLogger
 	options          option.NaiveInboundOptions
 	listener         *listener.Listener
@@ -56,10 +59,12 @@ type Inbound struct {
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveInboundOptions) (adapter.Inbound, error) {
 	inbound := &Inbound{
-		Adapter: inbound.NewAdapter(C.TypeNaive, tag),
-		ctx:     ctx,
-		router:  uot.NewRouter(router, logger),
-		logger:  logger,
+		Adapter:   inbound.NewAdapter(C.TypeNaive, tag),
+		ctx:       ctx,
+		router:    uot.NewRouter(router, logger),
+		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
+		logger:    logger,
+		options:   options,
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
@@ -111,6 +116,13 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 			Handler: h2c.NewHandler(n, &http2.Server{
 				MaxUploadBufferPerStream:     128 * 1024 * 1024,
 				MaxUploadBufferPerConnection: 256 * 1024 * 1024,
+				// Reclaim idle H2 connections that carry no active streams. The smart
+				// group's health machinery opens short-lived probe/verdict sessions
+				// on rotating socket-pool partitions; without a server-side idle
+				// timeout those linger as idle goroutines/sessions for the process's
+				// lifetime. 5m is well above the client's keepalive/probe cadence, so
+				// it never closes a session that is actually in use (NG3).
+				IdleTimeout: 5 * time.Minute,
 			}),
 			BaseContext: func(listener net.Listener) context.Context {
 				return n.ctx
@@ -196,6 +208,27 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	source := sHttp.SourceAddress(request)
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
 
+	// Smart-group probe: served on this authenticated, post-200 path so it
+	// reuses the padding framing; never routed as real data (probe.go).
+	if isSmartProbe(destination.Fqdn) {
+		if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				n.badRequest(ctx, request, E.New("hijack failed"))
+				return
+			}
+			n.handleSmartProbe(ctx, &naiveConn{Conn: conn}, destination)
+		} else {
+			n.handleSmartProbe(ctx, &naiveH2Conn{
+				reader:        request.Body,
+				writer:        writer,
+				flusher:       writer.(http.Flusher),
+				remoteAddress: source,
+			}, destination)
+		}
+		return
+	}
+
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
 		conn, _, err := hijacker.Hijack()
 		if err != nil {
@@ -255,21 +288,4 @@ func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net
 
 func (n *Inbound) badRequest(ctx context.Context, request *http.Request, err error) {
 	n.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", request.RemoteAddr))
-}
-
-func rejectHTTP(writer http.ResponseWriter, statusCode int) {
-	hijacker, ok := writer.(http.Hijacker)
-	if !ok {
-		writer.WriteHeader(statusCode)
-		return
-	}
-	conn, _, err := hijacker.Hijack()
-	if err != nil {
-		writer.WriteHeader(statusCode)
-		return
-	}
-	if tcpConn, isTCP := common.Cast[*net.TCPConn](conn); isTCP {
-		tcpConn.SetLinger(0)
-	}
-	conn.Close()
 }

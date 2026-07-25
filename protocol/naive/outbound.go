@@ -269,6 +269,15 @@ func (h *Outbound) Client() *cronet.NaiveClient {
 	return h.client
 }
 
+// ProbeIsolationContext pins a dial to the named Chromium socket-pool partition
+// so the smart group's measurement probes use a dedicated session separate from
+// data connections, and can force a fresh session by varying the key (probe
+// generation / verdict — cronet-go fork addition). The smart group calls this
+// via an interface assertion, keeping cronet out of the group build.
+func (h *Outbound) ProbeIsolationContext(ctx context.Context, key string) context.Context {
+	return cronet.ContextWithIsolationKey(ctx, key)
+}
+
 type naiveDialer struct {
 	*cronet.NaiveClient
 }
