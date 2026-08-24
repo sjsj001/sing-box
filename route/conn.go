@@ -98,10 +98,24 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn net.Conn
 		err        error
 	)
+	if timing := dialer.ConnectTimingFromContext(ctx); timing != nil {
+		// Anything but the direct outbound establishes a proxy session rather
+		// than a connection to the destination, so its span must not be reported
+		// as a connect time. Group outbounds resolve to unknown leaves and count
+		// as relays too; a relay that can report a real connect time upgrades
+		// the timing itself.
+		if outbound, isOutbound := this.(adapter.Outbound); isOutbound && outbound.Type() != C.TypeDirect {
+			timing.MarkRelay()
+		}
+	}
+	dialStart := time.Now()
 	if len(metadata.DestinationAddresses) > 0 || metadata.Destination.IsIP() {
 		remoteConn, err = dialer.DialSerialNetwork(ctx, this, N.NetworkTCP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
 	} else {
 		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
+	}
+	if err == nil {
+		dialer.ConnectTimingFromContext(ctx).RecordDial(time.Since(dialStart))
 	}
 	if err != nil {
 		var remoteString string
