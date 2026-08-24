@@ -27,6 +27,7 @@ var (
 	bucketRuleSet          = []byte("rule_set")
 	bucketExternalUI       = []byte("external_ui")
 	bucketOutboundProvider = []byte("outbound_provider")
+	bucketSmart            = []byte("smart")
 
 	bucketNameList = []string{
 		string(bucketSelected),
@@ -35,6 +36,7 @@ var (
 		string(bucketRuleSet),
 		string(bucketExternalUI),
 		string(bucketOutboundProvider),
+		string(bucketSmart),
 		string(bucketRDRC),
 		string(bucketDNSCache),
 	}
@@ -217,23 +219,47 @@ func (c *CacheFile) start() error {
 		return E.Cause(err, "platform chown")
 	}
 	err = db.Batch(func(tx *bbolt.Tx) error {
-		return tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+		// Listed before anything is deleted, because bbolt does not promise a
+		// cursor survives a write underneath it.
+		//
+		// The nested pass also used to delete by the cache ID bucket's own name
+		// rather than by the child it was looking at, so with a cache ID
+		// configured it removed nothing and unknown buckets accumulated for the
+		// life of the file. Every name reachable there is on the list above, so
+		// making it work removes only what it was always meant to.
+		type nested struct {
+			parent *bbolt.Bucket
+			name   []byte
+		}
+		var (
+			roots    [][]byte
+			children []nested
+		)
+		err := tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
 			if name[0] == 0 {
 				return b.ForEachBucket(func(k []byte) error {
-					bucketName := string(k)
-					if !common.Contains(bucketNameList, bucketName) {
-						_ = b.DeleteBucket(name)
+					if !common.Contains(bucketNameList, string(k)) {
+						children = append(children, nested{b, append([]byte(nil), k...)})
 					}
 					return nil
 				})
-			} else {
-				bucketName := string(name)
-				if !(common.Contains(bucketNameList, bucketName) || strings.HasPrefix(bucketName, fakeipBucketPrefix)) {
-					_ = tx.DeleteBucket(name)
-				}
+			}
+			bucketName := string(name)
+			if !(common.Contains(bucketNameList, bucketName) || strings.HasPrefix(bucketName, fakeipBucketPrefix)) {
+				roots = append(roots, append([]byte(nil), name...))
 			}
 			return nil
 		})
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			_ = child.parent.DeleteBucket(child.name)
+		}
+		for _, name := range roots {
+			_ = tx.DeleteBucket(name)
+		}
+		return nil
 	})
 	if err != nil {
 		db.Close()

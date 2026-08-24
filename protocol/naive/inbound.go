@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
@@ -184,9 +185,11 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	// 认证成功，正常处理
-	writer.Header().Set("Padding", generatePaddingHeader())
-	writer.WriteHeader(http.StatusOK)
-	writer.(http.Flusher).Flush()
+	// Smart-aware clients get the response held back until the destination dial
+	// has settled, so it can carry the dial duration and report a status when
+	// the dial fails. Everyone else keeps the original immediate reply.
+	deferResponse := request.Header.Get(headerSmart) != ""
+	flusher := writer.(http.Flusher)
 
 	hostPort := request.Header.Get("-connect-authority")
 	if hostPort == "" {
@@ -198,19 +201,55 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	source := sHttp.SourceAddress(request)
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
 
+	if IsProbe(destination) {
+		// Answered here, with nothing dialed: the round trip a client measures
+		// from this is purely its own leg to this proxy.
+		writer.Header().Set("Padding", generatePaddingHeader())
+		writer.Header().Set(ConnectAckHeader, FormatConnectAck(ConnectAck{HasConnect: true}))
+		writer.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		return
+	}
+
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
+		if !deferResponse {
+			writer.Header().Set("Padding", generatePaddingHeader())
+			writer.WriteHeader(http.StatusOK)
+			flusher.Flush()
+		}
 		conn, _, err := hijacker.Hijack()
 		if err != nil {
 			n.badRequest(ctx, request, E.New("hijack failed"))
 			return
 		}
-		n.newConnection(ctx, false, &naiveConn{Conn: conn}, userName, source, destination)
+		var lazyResponder *responder
+		if deferResponse {
+			var timing *dialer.ConnectTiming
+			ctx, timing = dialer.WithConnectTiming(ctx)
+			lazyResponder = newResponder(ctx, n.logger, timing, hijackedResponseWriter(conn, request.ProtoMajor, request.ProtoMinor))
+		}
+		n.newConnection(ctx, false, &naiveConn{Conn: conn, responder: lazyResponder}, userName, source, destination)
 	} else {
+		var lazyResponder *responder
+		if deferResponse {
+			var timing *dialer.ConnectTiming
+			ctx, timing = dialer.WithConnectTiming(ctx)
+			lazyResponder = newResponder(ctx, n.logger, timing, h2ResponseWriter(writer, flusher))
+			// The writer belongs to this handler and dies with it, while the
+			// response can still be resolved from a goroutine — see
+			// responder.finish.
+			defer lazyResponder.finish()
+		} else {
+			writer.Header().Set("Padding", generatePaddingHeader())
+			writer.WriteHeader(http.StatusOK)
+			flusher.Flush()
+		}
 		n.newConnection(ctx, true, &naiveH2Conn{
 			reader:        request.Body,
 			writer:        writer,
-			flusher:       writer.(http.Flusher),
+			flusher:       flusher,
 			remoteAddress: source,
+			responder:     lazyResponder,
 		}, userName, source, destination)
 	}
 }
