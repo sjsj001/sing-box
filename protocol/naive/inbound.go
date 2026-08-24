@@ -51,6 +51,7 @@ type Inbound struct {
 	tlsConfig        tls.ServerConfig
 	httpServer       *http.Server
 	h3Server         io.Closer
+	fallbackHandler  http.Handler // 静态文件服务
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveInboundOptions) (adapter.Inbound, error) {
@@ -69,6 +70,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		network:          options.Network.Build(),
 		authenticator:    auth.NewAuthenticator(options.Users),
 	}
+
+	// 初始化 fallback 静态文件服务器（/var/www/html）
+	fileServer := http.FileServer(http.Dir("/var/www/html"))
+	inbound.fallbackHandler = fileServer
+
 	if common.Contains(inbound.network, N.NetworkUDP) {
 		if options.TLS == nil || !options.TLS.Enabled {
 			return nil, E.New("TLS is required for QUIC server")
@@ -104,7 +110,10 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 		}
 		n.httpServer = &http.Server{
 			//nolint:staticcheck
-			Handler: h2c.NewHandler(n, &http2.Server{}),
+			Handler: h2c.NewHandler(n, &http2.Server{
+				MaxUploadBufferPerStream:     128 * 1024 * 1024,
+				MaxUploadBufferPerConnection: 256 * 1024 * 1024,
+			}),
 			BaseContext: func(listener net.Listener) context.Context {
 				return n.ctx
 			},
@@ -151,24 +160,30 @@ func (n *Inbound) Close() error {
 
 func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	ctx := log.ContextWithNewID(request.Context())
+
+	// 检查是否是 CONNECT 请求
 	if request.Method != "CONNECT" {
-		rejectHTTP(writer, http.StatusBadRequest)
-		n.badRequest(ctx, request, E.New("not CONNECT request"))
-		return
-	} else if request.Header.Get("Padding") == "" {
-		rejectHTTP(writer, http.StatusBadRequest)
-		n.badRequest(ctx, request, E.New("missing naive padding"))
+		n.handleFallback(writer, request)
 		return
 	}
+
+	// 检查 Padding 头
+	if request.Header.Get("Padding") == "" {
+		n.handleFallback(writer, request)
+		return
+	}
+
+	// 检查认证
 	userName, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
 		authOk = n.authenticator.Verify(userName, password)
 	}
 	if !authOk {
-		rejectHTTP(writer, http.StatusProxyAuthRequired)
-		n.badRequest(ctx, request, E.New("authorization failed"))
+		n.handleFallback(writer, request)
 		return
 	}
+
+	// 认证成功，正常处理
 	writer.Header().Set("Padding", generatePaddingHeader())
 	writer.WriteHeader(http.StatusOK)
 	writer.(http.Flusher).Flush()
@@ -198,6 +213,15 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			remoteAddress: source,
 		}, userName, source, destination)
 	}
+}
+
+// 新增：处理 fallback（提供静态文件服务）
+func (n *Inbound) handleFallback(writer http.ResponseWriter, request *http.Request) {
+	ctx := request.Context()
+	n.logger.DebugContext(ctx, "fallback to static files for ", request.RemoteAddr)
+
+	// 使用静态文件服务器
+	n.fallbackHandler.ServeHTTP(writer, request)
 }
 
 func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net.Conn, userName string, source M.Socksaddr, destination M.Socksaddr) {
