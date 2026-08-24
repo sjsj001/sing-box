@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/netip"
 	"os"
 	"strings"
@@ -319,24 +320,49 @@ func TestNaiveSelfInsecureConcurrency(t *testing.T) {
 	require.True(t, naiveOutbound.Client().Engine().StartNetLogToFile(netLogPath, true))
 	defer naiveOutbound.Client().Engine().StopNetLog()
 
-	// Send multiple sequential connections to trigger round-robin
-	// With insecure_concurrency=3, connections will be distributed to 3 pools
-	for i := 0; i < 6; i++ {
-		testTCP(t, clientPort, testPort)
+	// Six concurrent streams: least-busy placement over the fixed three pools
+	// spreads them two each, and the netlog must show all three sessions.
+	// (The old rotation spread even sequential dials; balanced placement
+	// needs real concurrency to leave pool 0 — which is the point.)
+	startNaiveEcho(t)
+	held := holdConcurrentStreams(t, 6)
+	for _, conn := range held {
+		conn.Close()
 	}
 
 	naiveOutbound.Client().Engine().StopNetLog()
 
 	// Verify NetLog contains multiple independent HTTP/2 sessions
-	logContent, err := os.ReadFile(netLogPath)
-	require.NoError(t, err)
-	logStr := string(logContent)
-
-	// Count HTTP2_SESSION_INITIALIZED events to verify connection pool isolation
-	// NetLog stores event types as numeric IDs, HTTP2_SESSION_INITIALIZED = 249
-	sessionCount := strings.Count(logStr, `"type":249`)
+	sessionCount := netlogH2SessionCount(t, netLogPath)
 	require.GreaterOrEqual(t, sessionCount, 3,
 		"Expected at least 3 HTTP/2 sessions with insecure_concurrency=3. NetLog: %s", netLogPath)
+}
+
+// netlogH2SessionCount counts HTTP2_SESSION_INITIALIZED events in a netlog.
+// NetLog event ids are enum positions that shift whenever cronet is rebased,
+// so the id is resolved from the log's own constants table rather than
+// trusted from any one build.
+func netlogH2SessionCount(t *testing.T, netLogPath string) int {
+	logContent, err := os.ReadFile(netLogPath)
+	require.NoError(t, err)
+	var netLog struct {
+		Constants struct {
+			LogEventTypes map[string]int64 `json:"logEventTypes"`
+		} `json:"constants"`
+		Events []struct {
+			Type int64 `json:"type"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(logContent, &netLog))
+	initializedID, hasInitialized := netLog.Constants.LogEventTypes["HTTP2_SESSION_INITIALIZED"]
+	require.True(t, hasInitialized, "netlog constants table lost HTTP2_SESSION_INITIALIZED")
+	sessionCount := 0
+	for _, event := range netLog.Events {
+		if event.Type == initializedID {
+			sessionCount++
+		}
+	}
+	return sessionCount
 }
 
 func TestNaiveSelfQUIC(t *testing.T) {

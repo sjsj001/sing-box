@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -112,13 +113,23 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 		n.httpServer = &http.Server{
 			//nolint:staticcheck
 			Handler: h2c.NewHandler(n, &http2.Server{
-				MaxUploadBufferPerStream:     128 * 1024 * 1024,
-				MaxUploadBufferPerConnection: 256 * 1024 * 1024,
+				// Upload direction (client → proxy). CONNECT upload today is
+				// interactive-sized, so these bound what one connection can
+				// pin in server memory instead of the 128/256MB they used to
+				// allow; raise them if bulk upload ever becomes a workload.
+				MaxUploadBufferPerStream:     8 * 1024 * 1024,
+				MaxUploadBufferPerConnection: 16 * 1024 * 1024,
+				// A connection with zero open streams is a parked client pool
+				// slot. The timer only runs while no stream is open, so a
+				// long-lived CONNECT or UoT session is never cut, however
+				// silent it is.
+				IdleTimeout: 120 * time.Second,
 			}),
 			BaseContext: func(listener net.Listener) context.Context {
 				return n.ctx
 			},
 		}
+		keepRoundRobinWriteScheduler(n.httpServer)
 		listener := net.Listener(tcpListener)
 		if n.tlsConfig != nil {
 			if len(n.tlsConfig.NextProtos()) == 0 {

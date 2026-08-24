@@ -38,17 +38,18 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 type Outbound struct {
 	outbound.Adapter
-	ctx         context.Context
-	logger      logger.ContextLogger
-	client      *cronet.NaiveClient
-	uotClient   *uot.Client
-	concurrency int
+	ctx       context.Context
+	logger    logger.ContextLogger
+	client    *cronet.NaiveClient
+	uotClient *uot.Client
 }
 
 // Pools reports how many isolated connection pools streams are spread over, so
 // a caller that wants none of them cold knows how many connections to open.
+// With no explicit insecure_concurrency the pools are adaptive and this is a
+// live count, so a warmup pass tracks demand instead of a constant.
 func (h *Outbound) Pools() int {
-	return h.concurrency
+	return h.client.Pools()
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveOutboundOptions) (adapter.Outbound, error) {
@@ -193,14 +194,15 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
 	}
 	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
-		Context:                  ctx,
-		Logger:                   logger,
-		ServerAddress:            serverAddress,
-		ServerName:               serverName,
-		Username:                 options.Username,
-		Password:                 options.Password,
-		InsecureConcurrency:      options.InsecureConcurrency,
-		ExtraHeaders:             extraHeaders,
+		Context:             ctx,
+		Logger:              logger,
+		ServerAddress:       serverAddress,
+		ServerName:          serverName,
+		Username:            options.Username,
+		Password:            options.Password,
+		InsecureConcurrency: options.InsecureConcurrency,
+		ExtraHeaders:        extraHeaders,
+		// Session window; cronet advertises half of it per stream.
 		ReceiveWindow:            options.ReceiveWindow.Value(),
 		TrustedRootCertificates:  trustedRootCertificates,
 		Dialer:                   outboundDialer,
@@ -229,17 +231,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	} else {
 		networks = []string{N.NetworkTCP}
 	}
-	concurrency := options.InsecureConcurrency
-	if concurrency < 1 {
-		concurrency = 1
-	}
 	return &Outbound{
-		Adapter:     outbound.NewAdapterWithDialerOptions(C.TypeNaive, tag, networks, options.DialerOptions),
-		ctx:         ctx,
-		logger:      logger,
-		client:      client,
-		uotClient:   uotClient,
-		concurrency: concurrency,
+		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeNaive, tag, networks, options.DialerOptions),
+		ctx:       ctx,
+		logger:    logger,
+		client:    client,
+		uotClient: uotClient,
 	}, nil
 }
 
