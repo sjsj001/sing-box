@@ -3,6 +3,7 @@ package dialer
 import (
 	"context"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -91,6 +92,18 @@ func (d *resolveDialer) initServer() {
 	d.queryOptions.Transport = transport
 }
 
+// lookupTimed resolves fqdn and records how long it took into any ConnectTiming
+// seeded on ctx, so an inbound reporting timings can take resolution out of the
+// dial span and report the pure connect time.
+func lookupTimed(ctx context.Context, router adapter.DNSRouter, fqdn string, options adapter.DNSQueryOptions) ([]netip.Addr, error) {
+	start := time.Now()
+	addresses, err := router.Lookup(ctx, fqdn, options)
+	if err == nil {
+		ConnectTimingFromContext(ctx).RecordDNS(time.Since(start))
+	}
+	return addresses, err
+}
+
 func (d *resolveDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	err := d.initialize()
 	if err != nil {
@@ -100,7 +113,7 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 		return d.dialer.DialContext(ctx, network, destination)
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
+	addresses, err := lookupTimed(ctx, d.router, destination.Fqdn, d.queryOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +133,7 @@ func (d *resolveDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 		return d.dialer.ListenPacket(ctx, destination)
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
+	addresses, err := lookupTimed(ctx, d.router, destination.Fqdn, d.queryOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +161,7 @@ func (d *resolveParallelNetworkDialer) DialParallelInterface(ctx context.Context
 		return d.dialer.DialContext(ctx, network, destination)
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
+	addresses, err := lookupTimed(ctx, d.router, destination.Fqdn, d.queryOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +184,7 @@ func (d *resolveParallelNetworkDialer) ListenSerialInterfacePacket(ctx context.C
 		return d.dialer.ListenPacket(ctx, destination)
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
-	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
+	addresses, err := lookupTimed(ctx, d.router, destination.Fqdn, d.queryOptions)
 	if err != nil {
 		return nil, err
 	}

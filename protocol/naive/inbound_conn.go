@@ -175,6 +175,7 @@ func (p *paddingConn) writerReplaceable() bool {
 type naiveConn struct {
 	net.Conn
 	paddingConn
+	*responder
 }
 
 func (c *naiveConn) Read(p []byte) (n int, err error) {
@@ -183,14 +184,40 @@ func (c *naiveConn) Read(p []byte) (n int, err error) {
 }
 
 func (c *naiveConn) Write(p []byte) (n int, err error) {
+	if err = c.awaitServed(); err != nil {
+		return 0, err
+	}
 	n, err = c.writeChunked(c.Conn, p)
 	return n, wrapError(err)
 }
 
 func (c *naiveConn) WriteBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
+	if err := c.awaitServed(); err != nil {
+		return err
+	}
 	err := c.writeBufferWithPadding(c.Conn, buffer)
 	return wrapError(err)
+}
+
+func (c *naiveConn) ConnHandshakeSuccess(conn net.Conn) error {
+	return c.success(conn)
+}
+
+func (c *naiveConn) HandshakeSuccess() error {
+	return c.success(nil)
+}
+
+func (c *naiveConn) HandshakeFailure(err error) error {
+	if c.responder == nil {
+		// Without a deferred response the reply is long gone, so fall back to
+		// what the generic path would have done with a plain connection.
+		if tcpConn, isTCPConn := common.Cast[interface{ SetLinger(int) error }](c.Conn); isTCPConn {
+			tcpConn.SetLinger(0)
+		}
+		return nil
+	}
+	return c.failure(err)
 }
 
 func (c *naiveConn) FrontHeadroom() int      { return c.frontHeadroom() }
@@ -206,6 +233,7 @@ type naiveH2Conn struct {
 	flusher       http.Flusher
 	remoteAddress net.Addr
 	paddingConn
+	*responder
 }
 
 func (c *naiveH2Conn) Read(p []byte) (n int, err error) {
@@ -214,6 +242,9 @@ func (c *naiveH2Conn) Read(p []byte) (n int, err error) {
 }
 
 func (c *naiveH2Conn) Write(p []byte) (n int, err error) {
+	if err = c.awaitServed(); err != nil {
+		return 0, err
+	}
 	n, err = c.writeChunked(c.writer, p)
 	if err == nil {
 		c.flusher.Flush()
@@ -223,11 +254,26 @@ func (c *naiveH2Conn) Write(p []byte) (n int, err error) {
 
 func (c *naiveH2Conn) WriteBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
+	if err := c.awaitServed(); err != nil {
+		return err
+	}
 	err := c.writeBufferWithPadding(c.writer, buffer)
 	if err == nil {
 		c.flusher.Flush()
 	}
 	return wrapError(err)
+}
+
+func (c *naiveH2Conn) ConnHandshakeSuccess(conn net.Conn) error {
+	return c.success(conn)
+}
+
+func (c *naiveH2Conn) HandshakeSuccess() error {
+	return c.success(nil)
+}
+
+func (c *naiveH2Conn) HandshakeFailure(err error) error {
+	return c.failure(err)
 }
 
 func wrapError(err error) error {
