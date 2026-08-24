@@ -74,7 +74,13 @@ Authentication password.
 
 #### insecure_concurrency
 
-Number of concurrent tunnel connections. Multiple connections make the tunneling easier to detect through traffic analysis, which defeats the purpose of NaiveProxy's design to resist traffic analysis.
+Number of concurrent tunnel connections.
+
+When omitted (or `0`) the pool is adaptive: an idle client holds at most one connection; concurrent traffic rides at least two, so a single bad pipe cannot stall everything; parallel streams toward one destination — a segmented download — spread two per connection, since packing them caps the aggregate at a single TCP flow's ceiling; and no connection carries more than four streams. A bulk transfer hogging a pipe gets routed around, and a recently-drained connection is reused before a new one is dialed. The ceiling is derived from available memory divided by the session receive window, clamped between 2 and 16. With `quic` enabled there is no pooling — always a single connection.
+
+An explicit value keeps exactly that many pools, with new streams balanced onto the least busy one.
+
+Multiple connections make the tunneling easier to detect through traffic analysis, which defeats the purpose of NaiveProxy's design to resist traffic analysis.
 
 #### extra_headers
 
@@ -82,11 +88,17 @@ Extra headers to send in HTTP requests.
 
 #### stream_receive_window
 
-The flow control window.
+HTTP/2 receive window, as a number in bytes or a string like `"20mb"`.
 
-When `quic` is enabled, it sets the initial QUIC stream receive window, and `6 MB` is used by default.
+!!! warning "Session window, not stream window"
 
-Otherwise, it sets the HTTP/2 session receive window, the stream receive window is set to half of it, and `4 MB` is used by default on iOS, `128 MB` on other platforms.
+    Despite the name, this value is the **session** (connection-level) receive
+    window. Cronet advertises **half of it** as the per-stream window. A value
+    of `20mb` therefore caps a single stream at 10MB in flight — size legs so
+    that half the value still covers `bandwidth × RTT`, or single-stream
+    throughput is capped below line rate.
+
+`128mb` is used by default (Chromium's default; 64MB per stream), `4mb` on iOS. When `quic` is enabled the halving rule does not apply: the value is the per-stream window directly — see `quic_session_receive_window`.
 
 #### udp_over_tcp
 
@@ -113,13 +125,11 @@ QUIC congestion control algorithm.
 
 #### quic_session_receive_window
 
-!!! note ""
+QUIC session (connection-level) receive window, as a number in bytes or a string like `"15mb"`.
 
-    Only used when `quic` is enabled.
+Unlike `stream_receive_window`, the halving rule does not apply here: when `quic` is enabled, `stream_receive_window` is the per-stream window directly (default 6MB) and this field is the session window (default 15MB).
 
-The initial QUIC session receive window.
-
-`15 MB` is used by default.
+Only takes effect when `quic` is enabled.
 
 #### tls
 

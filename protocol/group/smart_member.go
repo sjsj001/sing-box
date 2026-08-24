@@ -155,10 +155,13 @@ func (m *smartMember) setup() time.Duration {
 // warmupDials is how many connections it takes to leave none of this member's
 // pools cold.
 //
-// naive hands each new stream to the next pool in rotation, so the count is the
-// member's own concurrency and nothing else: fewer leaves some pools cold and
-// the handshake lands on whichever probe draws one, later leaves the extra
-// dials landing back on pools that are already warm.
+// naive balances each new stream onto its least-loaded pool, so this many
+// concurrent dials reach every pool when the pools sit evenly loaded — which
+// between warmups they do. The count is live: an adaptive member reports the
+// pools demand has actually opened, a fixed one its configured constant.
+// Fewer dials leaves some pools cold and the handshake lands on whichever
+// probe draws one; more lands the extra dials back on pools that are already
+// warm.
 func (m *smartMember) warmupDials() int {
 	pooled, isPooled := common.Cast[naive.PooledOutbound](m.outbound)
 	if !isPooled {
