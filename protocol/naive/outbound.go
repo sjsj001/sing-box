@@ -5,7 +5,10 @@ package naive
 import (
 	"context"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"net"
+	"net/http"
 	"strings"
 
 	"github.com/sagernet/cronet-go"
@@ -35,10 +38,17 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 type Outbound struct {
 	outbound.Adapter
-	ctx       context.Context
-	logger    logger.ContextLogger
-	client    *cronet.NaiveClient
-	uotClient *uot.Client
+	ctx         context.Context
+	logger      logger.ContextLogger
+	client      *cronet.NaiveClient
+	uotClient   *uot.Client
+	concurrency int
+}
+
+// Pools reports how many isolated connection pools streams are spread over, so
+// a caller that wants none of them cold knows how many connections to open.
+func (h *Outbound) Pools() int {
+	return h.concurrency
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveOutboundOptions) (adapter.Outbound, error) {
@@ -125,6 +135,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			extraHeaders[key] = values[0]
 		}
 	}
+	// Announce that this client can handle a response held back until the
+	// destination dial has settled. Servers that do not know the extension
+	// ignore the header and answer immediately, as they always did.
+	extraHeaders[headerSmart] = "1"
 
 	dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
 	var dnsResolver cronet.DNSResolverFunc
@@ -215,12 +229,17 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	} else {
 		networks = []string{N.NetworkTCP}
 	}
+	concurrency := options.InsecureConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
 	return &Outbound{
-		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeNaive, tag, networks, options.DialerOptions),
-		ctx:       ctx,
-		logger:    logger,
-		client:    client,
-		uotClient: uotClient,
+		Adapter:     outbound.NewAdapterWithDialerOptions(C.TypeNaive, tag, networks, options.DialerOptions),
+		ctx:         ctx,
+		logger:      logger,
+		client:      client,
+		uotClient:   uotClient,
+		concurrency: concurrency,
 	}, nil
 }
 
@@ -240,7 +259,12 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-		return h.client.DialEarly(ctx, destination)
+		conn, err := dialEarly(ctx, h.client, destination)
+		if err != nil {
+			return nil, err
+		}
+		logMeasurement(h.ctx, h.logger, conn, destination)
+		return conn, nil
 	case N.NetworkUDP:
 		if h.uotClient == nil {
 			return nil, E.New("UDP is not supported unless UDP over TCP is enabled")
@@ -276,5 +300,152 @@ type naiveDialer struct {
 }
 
 func (d *naiveDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	return d.NaiveClient.DialEarly(ctx, destination)
+	return dialEarly(ctx, d.NaiveClient, destination)
 }
+
+// dialEarly opens a tunnel and hands back a connection that can report the
+// smart-extension measurements. A failure here means this client never got an
+// answer out of the proxy at all, which is a problem with the hop rather than
+// with the destination — the distinction decides whether a client drops one
+// destination or the whole node.
+func dialEarly(ctx context.Context, client *cronet.NaiveClient, destination M.Socksaddr) (net.Conn, error) {
+	conn, err := client.DialEarly(ctx, destination)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrNextHopUnreachable, err)
+	}
+	return &dialConn{NaiveConn: conn}, nil
+}
+
+// logMeasurement reports the path split for one connection once the proxy has
+// answered. It runs detached because the answer arrives after DialEarly returns
+// — waiting for it inline would hold back the payload the caller is about to
+// write.
+func logMeasurement(ctx context.Context, logger logger.ContextLogger, conn net.Conn, destination M.Socksaddr) {
+	measured, isMeasured := conn.(MeasuredConn)
+	if !isMeasured {
+		return
+	}
+	go func() {
+		measurement, err := measured.Measure(ctx)
+		if err != nil {
+			if errors.Is(err, ErrClosedLocally) || errors.Is(err, context.Canceled) {
+				// Nobody is waiting for this reading any more, by the two routes
+				// that produce that: the tunnel was closed from this side, or
+				// the caller stopped waiting. Neither says anything about the
+				// path, and this line reaches an operator alongside real
+				// failures — where it has already been read as one. A heartbeat
+				// closing its own probe leaves this goroutine holding
+				// ErrClosedLocally, so during an outage the trail filled with
+				// "closed by this end" beside the verdict that was reached on a
+				// deadline, and an audit concluded the verdict had been
+				// swallowed. Same line the ranking draws: see
+				// naive.ErrClosedLocally.
+				return
+			}
+			logger.DebugContext(ctx, "measure connection to ", destination, ": ", err)
+			return
+		}
+		// The three legs, not just the two that used to be here. Working out
+		// where a relay's time went meant subtracting span and remote from the
+		// round trip by hand, which is how an interior that had grown to three
+		// seconds went unnoticed while the line said local=132ms.
+		chain, hasChain := measurement.ChainSpan()
+		logger.DebugContext(ctx, "measured ", destination,
+			" setup_us=", measurement.Setup.Microseconds(),
+			" rtt_us=", measurement.RoundTrip.Microseconds(),
+			" span_us=", measurement.ServerSpan.Microseconds(),
+			" remote_us=", measurement.RemoteDial.Microseconds(),
+			" near_us=", measurement.NearHop().Microseconds(),
+			" chain_us=", chain.Microseconds(),
+			" has_chain=", hasChain,
+			" has_remote=", measurement.HasRemote)
+	}()
+}
+
+// dialConn exposes the smart-extension accessors on top of a naive connection:
+// the innermost dial duration the proxy reported, and the locally measured
+// setup/round-trip split. Together they let a caller separate the client-to-proxy
+// leg from the proxy-to-destination leg, which is the whole point of the
+// extension.
+type dialConn struct {
+	cronet.NaiveConn
+}
+
+// localClose re-labels the transport's "this end closed it" as this package's,
+// so that the code which has to recognise it can do so without importing the
+// transport — which is behind a build tag that code is not. Everything else is
+// passed through untouched, including the classification the callers below then
+// put on it: a local close still has to reach a relay as a hop-level failure,
+// because an error that arrives unclassified is answered with the status that
+// downstream reads as a licence to replay the payload.
+func localClose(err error) error {
+	if err != nil && errors.Is(err, cronet.ErrClosedLocally) {
+		return ErrClosedLocally
+	}
+	return err
+}
+
+func (c *dialConn) Measure(ctx context.Context) (ConnMeasurement, error) {
+	err := localClose(c.HandshakeContext(ctx))
+	if err != nil {
+		return ConnMeasurement{}, classifyHandshakeError(err)
+	}
+	var measurement ConnMeasurement
+	if timing, hasTiming := c.Timing(); hasTiming {
+		measurement.Setup = timing.Setup
+		measurement.RoundTrip = timing.RoundTrip
+	}
+	value, _ := c.ResponseHeader(ConnectAckHeader)
+	ack, hasAck := ParseConnectAck(value)
+	if !hasAck {
+		// A plain naiveproxy server, or one built before the extension. It
+		// tunnels fine, but nothing here can be split into legs, and the caller
+		// must not read the absence as a measurement.
+		return measurement, nil
+	}
+	measurement.ServerSpan = ack.Total
+	measurement.HasSpan = true
+	// What reaching the destination cost, the connect and the lookup together.
+	// Why they are summed rather than one subtracted, and the one comparison
+	// where overstating it still pays, are on ConnectAck.DestinationLeg.
+	measurement.RemoteDial, measurement.HasRemote = ack.DestinationLeg()
+	if measurement.HasRemote {
+		measurement.Resolve, measurement.HasResolve = ack.Resolve, ack.HasResolve
+	}
+	return measurement.Validated(), nil
+}
+
+func (c *dialConn) RemoteAck(ctx context.Context) (ConnectAck, bool, error) {
+	if err := localClose(c.HandshakeContext(ctx)); err != nil {
+		return ConnectAck{}, false, classifyHandshakeError(err)
+	}
+	value, _ := c.ResponseHeader(ConnectAckHeader)
+	ack, hasAck := ParseConnectAck(value)
+	return ack, hasAck, nil
+}
+
+// classifyHandshakeError decides whom to blame for a refused CONNECT. Only a
+// StatusBadGateway from the next hop means the destination itself was
+// unreachable; anything else — including no answer at all — means the hop is
+// the part that is broken.
+func classifyHandshakeError(err error) error {
+	var handshakeError *cronet.HandshakeError
+	if !errors.As(err, &handshakeError) {
+		// No status came back at all: a deadline, a dropped route, a session
+		// that died. Carries no ErrProxyAnswered, which is what lets a probe
+		// tell this from the proxy refusing something — see the sentinel.
+		return fmt.Errorf("%w: %w", ErrNextHopUnreachable, err)
+	}
+	if handshakeError.StatusCode == http.StatusBadGateway {
+		return fmt.Errorf("%w: %w: %w", ErrDestinationUnreachable, ErrProxyAnswered, err)
+	}
+	return fmt.Errorf("%w: %w: %w", ErrNextHopUnreachable, ErrProxyAnswered, err)
+}
+
+func (c *dialConn) WaitReady(ctx context.Context) error {
+	return localClose(c.NaiveConn.WaitReady(ctx))
+}
+
+func (c *dialConn) Upstream() any           { return c.NaiveConn }
+func (c *dialConn) ReaderReplaceable() bool { return true }
+func (c *dialConn) WriterReplaceable() bool { return true }
