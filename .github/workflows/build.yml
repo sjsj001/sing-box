@@ -91,51 +91,7 @@ jobs:
       max-parallel: 13
       matrix:
         include:
-          - { os: linux, arch: amd64, variant: purego, naive: true }
-          - { os: linux, arch: amd64, variant: glibc, naive: true }
-          - { os: linux, arch: amd64, variant: musl, naive: true, debian: amd64, rpm: x86_64, pacman: x86_64, alpine: x86_64, openwrt: "x86_64" }
-
-          - { os: linux, arch: arm64, variant: purego, naive: true }
-          - { os: linux, arch: arm64, variant: glibc, naive: true }
-          - { os: linux, arch: arm64, variant: musl, naive: true, debian: arm64, rpm: aarch64, pacman: aarch64, alpine: aarch64, openwrt: "aarch64_cortex-a53 aarch64_cortex-a72 aarch64_cortex-a76 aarch64_generic" }
-
-          - { os: linux, arch: "386", go386: sse2 }
-          - { os: linux, arch: "386", variant: glibc, naive: true, go386: sse2 }
-          - { os: linux, arch: "386", variant: musl, naive: true, go386: sse2, debian: i386, rpm: i386, alpine: x86, openwrt: "i386_pentium4" }
-
-          - { os: linux, arch: arm, goarm: "7" }
-          - { os: linux, arch: arm, variant: glibc, naive: true, goarm: "7" }
-          - { os: linux, arch: arm, variant: musl, naive: true, goarm: "7", debian: armhf, rpm: armv7hl, pacman: armv7hl, alpine: armv7, openwrt: "arm_cortex-a5_vfpv4 arm_cortex-a7_neon-vfpv4 arm_cortex-a7_vfpv4 arm_cortex-a8_vfpv3 arm_cortex-a9_neon arm_cortex-a9_vfpv3-d16 arm_cortex-a15_neon-vfpv4" }
-
-          - { os: linux, arch: mipsle, gomips: hardfloat, naive: true, variant: glibc }
-          - { os: linux, arch: mipsle, gomips: softfloat, naive: true, variant: musl, debian: mipsel, rpm: mipsel, openwrt: "mipsel_24kc mipsel_74kc mipsel_mips32" }
-          - { os: linux, arch: mips64le, gomips: hardfloat, naive: true, variant: glibc, debian: mips64el, rpm: mips64el }
-          - { os: linux, arch: riscv64, naive: true, variant: glibc }
-          - { os: linux, arch: riscv64, naive: true, variant: musl, debian: riscv64, rpm: riscv64, alpine: riscv64, openwrt: "riscv64_generic" }
-          - { os: linux, arch: loong64, naive: true, variant: glibc }
-          - { os: linux, arch: loong64, naive: true, variant: musl, debian: loongarch64, rpm: loongarch64, alpine: loongarch64, openwrt: "loongarch64_generic" }
-
-          - { os: linux, arch: "386", go386: softfloat, openwrt: "i386_pentium-mmx" }
-          - { os: linux, arch: arm, goarm: "5", openwrt: "arm_arm926ej-s arm_cortex-a7 arm_cortex-a9 arm_fa526 arm_xscale" }
-          - { os: linux, arch: arm, goarm: "6", debian: armel, rpm: armv6hl, openwrt: "arm_arm1176jzf-s_vfp" }
-          - { os: linux, arch: mips, gomips: softfloat, openwrt: "mips_24kc mips_4kec mips_mips32" }
-          - { os: linux, arch: mipsle, gomips: hardfloat, openwrt: "mipsel_24kc_24kf" }
-          - { os: linux, arch: mipsle, gomips: softfloat }
-          - { os: linux, arch: mips64, gomips: softfloat, openwrt: "mips64_mips64r2 mips64_octeonplus" }
-          - { os: linux, arch: mips64le, gomips: hardfloat }
-          - { os: linux, arch: mips64le, gomips: softfloat, openwrt: "mips64el_mips64r2" }
-          - { os: linux, arch: s390x, debian: s390x, rpm: s390x }
-          - { os: linux, arch: ppc64le, debian: ppc64el, rpm: ppc64le }
-          - { os: linux, arch: riscv64 }
-          - { os: linux, arch: loong64 }
-
-          - { os: windows, arch: amd64, legacy_win7: true, legacy_name: "windows-7" }
-          - { os: windows, arch: "386", legacy_win7: true, legacy_name: "windows-7" }
-
-          - { os: android, arch: arm64, ndk: "aarch64-linux-android23" }
-          - { os: android, arch: arm, ndk: "armv7a-linux-androideabi23" }
-          - { os: android, arch: amd64, ndk: "x86_64-linux-android23" }
-          - { os: android, arch: "386", ndk: "i686-linux-android23" }
+          - { os: linux, arch: amd64, variant: glibc, naive: true, debian: amd64 }
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -177,13 +133,22 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r28
+      - name: Rewrite CRONET_GO_VERSION to go branch
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          echo "go" > .github/CRONET_GO_VERSION
+          cat .github/CRONET_GO_VERSION
+      - name: Inject cronet-go pseudo version replace
+        if: matrix.naive
+        run: bash .github/inject_cronet_fork.sh
       - name: Clone cronet-go
         if: matrix.naive && matrix.variant != 'purego'
         run: |
           set -xeuo pipefail
           CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
           git init ~/cronet-go
-          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go remote add origin https://github.com/sjsj001/cronet-go.git
           git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
           git -C ~/cronet-go fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
@@ -468,7 +433,13 @@ jobs:
           path: "dist"
   build_darwin:
     name: Build Darwin binaries
-    if: ${{ !failure() && !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary') }}
+    # Disabled on this fork: we only ship the Linux binary (the "build" job,
+    # whose matrix is a single linux/amd64 entry). Darwin and Windows also
+    # answer to build type "Binary", so without this they run on every dispatch
+    # and fail — they would need the cronet fork injected too, and nothing here
+    # consumes their artifacts. Kept as a one-line override rather than deleting
+    # the jobs, so merges from upstream stay trivial.
+    if: false # was: ${{ !failure() && !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary') }}
     runs-on: macos-latest
     needs:
       - calculate_version
@@ -569,7 +540,8 @@ jobs:
           path: "dist"
   build_windows:
     name: Build Windows binaries
-    if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
+    # Disabled on this fork — see the note on build_darwin.
+    if: false # was: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
     runs-on: windows-latest
     needs:
       - calculate_version
