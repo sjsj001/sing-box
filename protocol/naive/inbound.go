@@ -24,7 +24,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	aTLS "github.com/sagernet/sing/common/tls"
 	sHttp "github.com/sagernet/sing/protocol/http"
 
 	"golang.org/x/net/http2"
@@ -137,7 +136,7 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 			} else if !common.Contains(n.tlsConfig.NextProtos(), http2.NextProtoTLS) {
 				n.tlsConfig.SetNextProtos(append([]string{http2.NextProtoTLS}, n.tlsConfig.NextProtos()...))
 			}
-			listener = aTLS.NewListener(tcpListener, n.tlsConfig)
+			listener = &lazyListener{Listener: tcpListener, config: n.tlsConfig}
 		}
 		go func() {
 			sErr := n.httpServer.Serve(listener)
