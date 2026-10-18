@@ -126,11 +126,13 @@ func TestNaiveSelfAdaptivePools(t *testing.T) {
 	single := naiveExchange(t)
 	require.Equal(t, 1, naiveOutbound.Pools(), "a lone stream must not grow the pool set")
 
-	// Eight more concurrent streams make nine, all to one destination: they
-	// spread two per connection, so the set must grow to exactly five —
-	// demand-shaped, nothing more.
+	// Eight more concurrent streams make nine, all to one destination. Only
+	// the lone stream's session is up when they arrive: it takes them, up to
+	// twice the usual four, while one more pool dials, and the ninth rides that
+	// dial. Two pools, demand-shaped, nothing more.
 	held := holdConcurrentStreams(t, 8)
-	require.Equal(t, 5, naiveOutbound.Pools(), "nine same-destination streams should ride exactly five pools")
+	want := 2
+	require.Equal(t, want, naiveOutbound.Pools(), "nine same-destination streams should ride the warm session and one more pool")
 	single.Close()
 	for _, conn := range held {
 		conn.Close()
@@ -142,12 +144,12 @@ func TestNaiveSelfAdaptivePools(t *testing.T) {
 		5*time.Second, 50*time.Millisecond, "pool count should fall back to one after the burst drains")
 
 	naiveOutbound.Client().Engine().StopNetLog()
-	// Five pools mean at least five sessions; a parallel connect job may
-	// leave one transient extra, which is Chromium's business, not a failure.
+	// Each pool means at least one session; a parallel connect job may leave
+	// one transient extra, which is Chromium's business, not a failure.
 	sessions := netlogH2SessionCount(t, netLogPath)
-	require.GreaterOrEqual(t, sessions, 5,
-		"adaptive growth should have opened five h2 sessions. NetLog: %s", netLogPath)
-	require.LessOrEqual(t, sessions, 6,
+	require.GreaterOrEqual(t, sessions, want,
+		"adaptive growth should have opened one h2 session per pool. NetLog: %s", netLogPath)
+	require.LessOrEqual(t, sessions, want+1,
 		"more sessions than pools plus one transient connect race. NetLog: %s", netLogPath)
 }
 
