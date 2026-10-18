@@ -128,6 +128,8 @@ jobs:
         run: |-
           echo "PATH=$HOME/go/go_win7/bin:$PATH" >> $GITHUB_ENV
           echo "GOROOT=$HOME/go/go_win7" >> $GITHUB_ENV
+          # Fail on a version mismatch instead of fetching an unpatched Go.
+          echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
       - name: Setup Android NDK
         if: matrix.os == 'android'
         uses: nttld/setup-ndk@v1
@@ -488,6 +490,8 @@ jobs:
         run: |-
           echo "PATH=$HOME/go/go_osx/bin:$PATH" >> $GITHUB_ENV
           echo "GOROOT=$HOME/go/go_osx" >> $GITHUB_ENV
+          # Fail on a version mismatch instead of fetching an unpatched Go.
+          echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
       - name: Set tag
         run: |-
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"

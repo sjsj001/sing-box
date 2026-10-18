@@ -1,0 +1,14 @@
+github.com/reF1nd/sing-snell@94040c75f854957008e2776f40e094a3e4bc98bf (refs/heads/reF1nd-main, "Expose structured Snell server response errors")
+
+Plus one change, made in two places: the padding bits of a first record come
+from a ChaCha8 stream seeded from crypto/rand once per padding instead of
+four bytes of crypto/rand per bit.
+
+  - snellv5/record.go, the server side; snellv5/padding_test.go tests it.
+  - snellv4/record.go, the client sing-box's snell v4 and v5 outbounds both
+    use; snellv4/padding_test.go tests it.
+
+go.mod's require line for github.com/sagernet/sing-snell names a sagernet
+version; the directory replace takes precedence over it, so the version
+there says nothing about this copy. To move to a newer reF1nd revision,
+replace this directory with it and re-apply the change above in both places.
