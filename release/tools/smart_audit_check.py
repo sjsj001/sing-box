@@ -8,6 +8,7 @@ the numbers on the line, and are the numbers themselves plausible.
 import collections
 import datetime
 import json
+import os
 import re
 import sys
 
@@ -168,16 +169,27 @@ def resolve_names(records):
 
 
 def load(path):
+    # The previous generation first: a rotation can land in the middle of a
+    # state dump, and the current file alone then holds only its second half.
     records, broken = [], 0
-    with open(path, encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except Exception:
-                broken += 1
+    for part in (path + ".1", path):
+        if part != path and not os.path.exists(part):
+            continue
+        # A short write on a full disk leaves half a line, which can end inside
+        # a multi-byte character; the next record is appended straight after it.
+        with open(part, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    record = None
+                if isinstance(record, dict):
+                    records.append(record)
+                else:
+                    broken += 1
     return records, broken
 
 
@@ -198,15 +210,18 @@ def report(findings, limit=6):
         print(f"  ... 另有 {len(findings) - limit} 条")
 
 
-def check_races(races):
+def check_races(races, records):
     section(f"初始化（race）：{len(races)} 场")
 
     # Trails written before the outbound learned to flag an inherited value have
     # to be recognised by the value repeating unchanged from the previous race
     # for the same destination and group. On a trail that carries the flag the
     # guess is not only unnecessary but wrong: two rounds may legitimately
-    # measure the same microsecond.
-    flagged = any(g.get("cached") for r in races for g in r.get("groups", []))
+    # measure the same microsecond. Whether it carries the flag is read from
+    # every record, not only the races: switch and state records carry it too,
+    # and a trail whose races all happened to measure every group is still one
+    # written by an outbound that flags.
+    flagged = any(g.get("cached") for r in records for g in r.get("groups", []))
     previous = {}
 
     def stale(destination, tag, remote):
@@ -239,11 +254,11 @@ def check_races(races):
 
         for tag, g in table.items():
             seen[tag] += 1
-            if g.get("score") is not None:
-                answered[tag] += 1
-            elif g.get("failed"):
+            if g.get("failed"):
                 failed[tag] += 1
-                reasons[(tag, g["failed"][:60])] += 1
+                reasons[(tag, g["failed"])] += 1
+            elif g.get("score") is not None and not g.get("cached"):
+                answered[tag] += 1
             elif g.get("local") is None:
                 absent[tag] += 1
 
@@ -263,14 +278,19 @@ def check_races(races):
             slow.append(f"{r.get('destination')}  耗时 {elapsed}ms（撞上限）"
                         f"  未测量的组: {unmeasured or '无'}")
 
+    # A group left out of a round is not on its line at all, so its rate is
+    # over the rounds it was in. The absences are counted beside it, and a group
+    # that was in none still gets a row.
+    tags = set(seen) | {g.get("tag") for r in records for g in r.get("groups", []) if g.get("tag")}
     print("\n[各组答复率]")
-    for tag in sorted(seen, key=lambda t: -seen[t]):
+    for tag in sorted(tags, key=lambda t: (-seen[t], t)):
         total = seen[tag]
         rate = 100.0 * answered[tag] / total if total else 0
         note = ""
         if rate < 20:
             note = "  <== 几乎从不参与排名"
-        print(f"  {tag:4s} 出现 {total:4d}  答复 {answered[tag]:4d} ({rate:5.1f}%)"
+        print(f"  {tag:4s} 出现 {total:4d}  缺席 {len(races) - total:4d}"
+              f"  答复 {answered[tag]:4d} ({rate:5.1f}%)"
               f"  失败 {failed[tag]:4d}  无测量 {absent[tag]:4d}{note}")
 
     if reasons:
@@ -306,7 +326,9 @@ def check_switches(switches, races):
         from_score = ms(table.get(src, {}).get("score"))
         to_score = ms(table.get(dst, {}).get("score"))
         stamp = when(r)
-        history[destination].append((stamp, src, dst))
+        # By key: the group is chosen per host, and the moves of one host are
+        # spread over every port it was reached on.
+        history[r.get("key") or destination].append((stamp, src, dst, destination))
 
         listing.append(f"{destination}  {src or '(空)'} -> {dst}  by={reason}"
                        f"  {src}={from_score}ms {dst}={to_score}ms")
@@ -351,13 +373,13 @@ def check_switches(switches, races):
 
     print("\n[同一目标反复横跳]")
     flaps = []
-    for destination, moves in history.items():
+    for moves in history.values():
         moves.sort(key=lambda m: (m[0] is None, m[0]))
         for i in range(1, len(moves)):
             before, after = moves[i - 1], moves[i]
             if before[0] and after[0] and (after[0] - before[0]).total_seconds() <= FLAP_WINDOW_S:
                 if after[2] == before[1]:
-                    flaps.append(f"{destination}  {(after[0] - before[0]).total_seconds():.0f}s 内"
+                    flaps.append(f"{after[3]}  {(after[0] - before[0]).total_seconds():.0f}s 内"
                                  f" {before[1]} -> {before[2]} -> {after[2]}")
     report(flaps)
 
@@ -389,13 +411,16 @@ def check_members(members):
 
 def check_state(states, races):
     section("当前状态（state）：最后一次快照")
-    if not states:
+    # Compared as instants: Go writes the local offset, so across a DST change
+    # the later dump can be the smaller string.
+    stamped = [(t, r) for t, r in ((when(r), r) for r in states) if t is not None]
+    if not stamped:
         print("  没有状态记录")
         return
     index = race_index(races)
-    latest = max(r.get("time", "") for r in states)
-    current = [r for r in states if r.get("time") == latest]
-    print(f"  时刻 {latest}，共 {len(current)} 个目标")
+    latest = max(t for t, _ in stamped)
+    current = [r for t, r in stamped if t == latest]
+    print(f"  时刻 {current[0].get('time')}，共 {len(current)} 个目标")
 
     chosen = collections.Counter(r.get("to") or "(无)" for r in current)
     print("\n[选择分布]")
@@ -417,8 +442,14 @@ def check_state(states, races):
         for tag, g in table.items():
             if tag == picked:
                 continue
+            # A group that is down, or cooled on one of this host's ports, was
+            # not there to pick: neither the score the snapshot kept for it nor
+            # its silence says the choice was wrong.
+            if g.get("down") or g.get("blocked"):
+                continue
             if g.get("score") is not None:
-                if ms(g["score"]) < picked_score:
+                # Within the hysteresis the incumbent is kept on purpose.
+                if ms(g["score"]) < picked_score - SWITCH_HYSTERESIS_MS:
                     mismatched.append(f"{r.get('destination')}  在用 {picked}={picked_score}ms"
                                       f"，但 {tag}={ms(g['score'])}ms 更低")
                 continue
@@ -469,7 +500,8 @@ def check_state(states, races):
 def selftest():
     """Pin the floor semantics: python3 smart_audit_check.py --selftest.
 
-    Three trails, one per way the locked check can go. The point of keeping them
+    One trail per way the locked check can go, and one for a group that could
+    not be picked. The point of keeping them
     executable is the failure mode this check had before: a criterion that reads
     plausibly and reports the entire table.
     """
@@ -510,6 +542,46 @@ def selftest():
     # No round to read the silence against: counted, not guessed at.
     orphan = run([state("ccc")], [])
     assert "0 个目标（0 处）" in orphan and "未做判断" in orphan, orphan
+    # A group down or cooled on a port scores lower than the pick: not a
+    # mismatch, and not locked out either.
+    for flag in ("down", "blocked"):
+        unavailable = state("ddd")
+        unavailable["groups"][1].update({flag: True, "score": "1ms"})
+        skipped = run([unavailable], [race("ddd", "50ms")])
+        assert skipped.count("0 个目标（0 处）") == 2, skipped
+    # Failure reasons are counted whole: cut at 60 characters, a 503 and a 502
+    # from the same proxy were one line. A group that failed a refresh still
+    # carries its snapshot's score, marked cached: that is a failure, not an
+    # answer — and a cached score with no failure is no answer either.
+    refusals = []
+    for status in ("502", "503"):
+        refused = race("eee", "50ms")
+        refused["groups"][1].update({"score": "30ms", "cached": True,
+                                     "failed": ("next hop unreachable: the proxy answered: "
+                                                "unexpected response status: " + status)})
+        refusals.append(refused)
+    silent = race("eee", "50ms")
+    silent["groups"][1].update({"score": "30ms", "cached": True})
+    refusals.append(silent)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        check_races(refusals, refusals)
+    assert "status: 502" in out.getvalue() and "status: 503" in out.getvalue(), out.getvalue()
+    row = next(line for line in out.getvalue().splitlines() if line.startswith("  jp ") and "出现" in line)
+    assert "答复    0" in row and "失败    2" in row, row
+    # A half-written line ending inside "µ", and a line that is JSON but not a
+    # record: each counted as broken, neither taking the report down.
+    import tempfile
+    with tempfile.TemporaryDirectory() as scratch:
+        trail = os.path.join(scratch, "audit.jsonl")
+        with open(trail, "wb") as handle:
+            handle.write(b'{"type":"race","elapsed":"12\xc2{"type":"usage"}\n5\n{"type":"usage"}\n')
+        loaded, broken = load(trail)
+    assert loaded == [{"type": "usage"}] and broken == 2, (loaded, broken)
+    # Back an hour at a DST change: the later dump is the smaller string.
+    before, after = state("fff"), state("fff")
+    before["time"], after["time"] = "2026-10-25T02:17:00.5+02:00", "2026-10-25T02:17:00.5+01:00"
+    assert "时刻 2026-10-25T02:17:00.5+01:00，共 1 个目标" in run([after, before], []), "the later dump is current"
     print("selftest ok")
 
 
@@ -526,7 +598,7 @@ def main():
         by_type[r.get("type")].append(r)
 
     resolve_names(records)
-    check_races(by_type.get("race", []))
+    check_races(by_type.get("race", []), records)
     check_switches(by_type.get("switch", []), by_type.get("race", []))
     check_members(by_type.get("member", []))
     check_state(by_type.get("state", []), by_type.get("race", []))

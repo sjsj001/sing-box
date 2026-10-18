@@ -76,9 +76,9 @@ Authentication password.
 
 Number of concurrent tunnel connections.
 
-When omitted (or `0`) the pool is adaptive: an idle client holds at most one connection; concurrent traffic rides at least two, so a single bad pipe cannot stall everything; parallel streams toward one destination — a segmented download — spread two per connection, since packing them caps the aggregate at a single TCP flow's ceiling; and no connection carries more than four streams. A bulk transfer hogging a pipe gets routed around, and a recently-drained connection is reused before a new one is dialed. The ceiling is derived from available memory divided by the session receive window, clamped between 2 and 16. With `quic` enabled there is no pooling — always a single connection.
+When omitted (or `0`) the pool is adaptive: an idle client holds at most one connection; concurrent traffic rides at least two, so a single bad pipe cannot stall everything; parallel streams toward one destination — a segmented download — spread two per connection, since packing them caps the aggregate at a single TCP flow's ceiling; and below the ceiling no connection carries more than four streams. A bulk transfer hogging a pipe gets routed around, and a recently-drained connection is reused before a new one is dialed. The ceiling is a quarter of total memory (the cgroup limit or the machine total on Linux; a 2GB host is assumed on other platforms, 64MB on iOS) divided by the session receive window, clamped between 2 and 16: the default `128mb` window allows four connections on a 2GB host elsewhere, three on Linux, where such a host reports a little under 2GB. At the ceiling new streams stack onto the existing connections, which then carry more than four streams each. With `quic` enabled and this field omitted there is no pooling — always a single connection.
 
-An explicit value keeps exactly that many pools, with new streams balanced onto the least busy one — still skipping a pool a bulk transfer sits on, and still capping parallel streams to one destination at two per pool.
+An explicit value keeps exactly that many pools, with new streams balanced onto the least busy one — still skipping a pool a bulk transfer sits on, and still capping parallel streams to one destination at two per pool. With `quic` enabled an explicit value starts that many QUIC engines, one connection each (on iOS a single engine).
 
 Multiple connections make the tunneling easier to detect through traffic analysis, which defeats the purpose of NaiveProxy's design to resist traffic analysis.
 
@@ -98,7 +98,19 @@ HTTP/2 receive window, as a number in bytes or a string like `"20mb"`.
     that half the value still covers `bandwidth × RTT`, or single-stream
     throughput is capped below line rate.
 
-`128mb` is used by default (Chromium's default; 64MB per stream), `4mb` on iOS. When `quic` is enabled the halving rule does not apply: the value is the per-stream window directly — see `quic_session_receive_window`.
+`128mb` is used by default (NaiveProxy's default; 64MB per stream — Chromium's own default is 15MB per session and 6MB per stream), `4mb` on iOS. When `quic` is enabled the halving rule does not apply: the value is the per-stream window directly — see `quic_session_receive_window`.
+
+When this field is empty, stream windows are auto-tuned where the client's
+socket reports its RTT (Linux and Android). A session starts each stream at
+what 1200Mbps needs over the path's RTT, 8MB at least, which is what carries
+a stream at full speed from the start. Beyond that a stream doubles its
+window, up to 64MB, only when it keeps consuming half of it within two round
+trips while the path's smoothed RTT is at most 1.5 times its minimum. A slow
+reader therefore holds the starting window rather than 64MB, and a queue on
+the path does not grow the window it would fill. Setting the field turns
+auto-tuning off: half the value is then the fixed per-stream window. With a
+`detour` the default window is used fixed, since the RTT seen there is only
+that of the hop to the detour.
 
 #### udp_over_tcp
 
@@ -144,3 +156,5 @@ Self-signed certificates change traffic behavior significantly, which defeats th
 ### Dial Fields
 
 See [Dial Fields](/configuration/shared/dial/) for details.
+
+The TCP connection to the server is dialed by sing-box on a cronet thread pool thread, so the other streams of the engine go on while it is in progress, and dials started in a burst run side by side. A blackholed server costs the new session the whole connect timeout (5s by default) and nothing else; `connect_timeout` only sets how long that session waits. A dial still running after about 250ms gets a second one started next to it, as Chromium does for its own sockets, and the first to connect is used. UDP sockets for QUIC are still dialed on cronet's network thread: a dial that has to handshake, through a detour, stalls the engine for as long.

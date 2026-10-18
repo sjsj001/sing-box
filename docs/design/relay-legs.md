@@ -1,5 +1,7 @@
 # smart 中转链测量/评分/健康判定 —— 最终裁决设计
 
+> 文中的 `file:line` 大多指向实现之前的代码位置，已经漂移；查代码时以所引的函数名为准。
+
 ## 0. 裁决结论
 
 **骨架取 `fold`**（三段分解：near / chain / remote）。它是四份里唯一在对抗评审下没有致命问题的一份，而且它的核心恒等式我逐行核过代码后确认成立。
@@ -869,3 +871,55 @@ P0 的第三条价值最高：它立刻把这次诊断从「人工减三个数�
 **另一件：`RemoteDial = Connect + Resolve` 这个判断原本只存在于 `with_naive_outbound` 标签后面，而 CI 的测试标签集（`release/DEFAULT_BUILD_TAGS_OTHERS`）不含它——那条接线测试从不在 CI 跑，有人把它还原成 `ack.Connect`，CI 照绿。** 没有去动全局标签集（那会改变每个平台的发布内容），而是把判断本身提成 `ConnectAck.DestinationLeg()` 放进无标签的 `connect_ack.go`，标签后面只剩一行赋值；无标签测试 `TestTheDestinationLegIsTheConnectPlusFindingIt` 现在由 CI 常规跑到。
 
 **补上的测试缺口：** 暖测的第二个调用点（`collectStragglers`，也就是调用方已经拿着隧道走了之后的那一半）此前一条测试都没覆盖——原有五条的出口都即时应答，`pending` 恒为 0，那条路根本走不到。已用 gate 构造确定性 straggler 补上，并验过删掉那个调用点它会变红。
+
+**修订 13（实施后更正 · 仅文档）—— 「502 后用真实地址探测」和「按端口冷却」改变了 §4.4 第 1 条、§7 第 10 条和 §5.1 表 C 行。**
+正文不改，以本条为准。
+
+- **502 后用真实地址探测**（提交 "smart: Check a member that refused real traffic against a real address"）。没有链内段的成员，如果自上次心跳以来对真实流量回答过 502，下一次心跳改打真实地址（`probeTarget`），走现有的两地址交叉验证，两个都失败就判死。原因：出口自己的出网断了时，它对每个目标都回 502，而 `.probe.arpa` 照样应答，按原来的分工它永远判不死，组也永远不会换到能用的备用成员。所以 §4.4 第 1 条的「只有中转成员会发」「单跳部署下游看到的东西完全没变」不再成立：单跳部署里，回答过 502 的成员会在下一次心跳发一次真实地址探测。§7 第 10 条本身仍然不做（常规心跳没有全员改真实地址），但它说的「单跳部署下游看到的东西完全不变」同样不再成立，变化只限于回答过 502 的成员。
+- **按端口冷却**（提交 "smart: File a refusal under the port it was refused on"、"smart: Judge a refusal by its port, not the host's snapshot"、"smart: Keep a host where it is when its exit refuses only one port"）。§5.1 表 C 行写的是「只冷却该目标」。现在冷却按（组，端口）记在主机的快照上：一个端口被拒不影响同一主机的其他端口；一轮比较只清它到达的那个端口的冷却；刷新时没参赛（判死，或在本端口冷却）或本轮回 502 的组，测量保留一轮；在位组只在某个端口被冷却时，这个端口的连接走别的组，但不改 `Selected`、不记 switch。另外，C 段的 502 也不再只作用于目标：按上一条，它还让这个成员在下一次心跳接受真实地址探测，可能因此被判死。
+
+**修订 14（第 4–9 轮审查后补记 · 仅文档）—— 中转链相关的后续行为改动，以及正文里因此不再成立的五处。**
+正文不改，以本条为准。
+
+行为改动（编号是审查清单的编号，细节见对应提交说明）：
+
+- **R3-2**（"smart: Do not fall back to a down group where every group up refused"）。在线但因拒绝过该目标而冷却中的组算作在线，候选不再因此回落到判死的组；`errNoCandidate` 判断"所有组都拒绝"时不算判死的组。以前这种目标的每条连接都先拨判死的组、付 readyTimeout（切网后最长 30s），中继随后回 503。
+- **R3-5**（"smart: Re-race a destination its group's condemned member refused"）。成员记下判死时间；快照缺某个组、而该组参赛的成员在这一轮之后三个心跳周期内被判死时，快照算过时，重新竞速。出口断网到心跳判死之间竞速的目标，不再在快照的整个寿命里丢掉这个组。
+- **R3-6**（"smart: Say whose fault it was when a round finds nothing"）。竞速没有胜者时，只有每个组都问过且都拒绝，才包成 `ErrDestinationUnreachable`；否则包成 `ErrNextHopUnreachable`。本端的腿全断时，下游不再给每个新目标挂冷却。
+- **R3-7**（"smart: Keep a member's refusal when the probe that checks it is called off"）。打真实地址的探测被取消（例如切网叫停一轮）时，成员的 502 证据写回，下一次心跳仍打真实地址。
+- **R3-8**（"smart: Treat a stream the proxy refused unprocessed as neither verdict nor delivery"）。代理以 REFUSED_STREAM 拒绝的流记为 `naive.ErrStreamRefused`：心跳不据此判死（`markDown` 豁免它）；重放许可按未送达处理；刷新时撞上它的组，测量保留一轮，与修订 13 的"没参赛、回 502"并列。
+- **R7-8**（"naive: Treat a stream this end aborted as no reading of the proxy"）。ERR_ABORTED、ERR_NETWORK_CHANGED 只由本端产生，`localClose` 把它们标成 `naive.ErrClosedLocally`，`markDown` 和 `reportFailure` 都不把它当读数。切网时 smart 在配置里排在成员前面、探测被成员自己的 `CloseAllConnections` 打断，健康成员不再被判死 40–80 秒；这种情况下若本轮未作废，`probeMember` 重试一次。
+- **R8-5**（"smart: Log every revival, and say where a failover came from"）。判死后的每一种复活（真实流量、竞速、重测、心跳）都打一次 "is reachable again"；"failed over" 一行写明离开的组和它的错误；替身也全部拒绝时，返回最后一个拒绝，前面带上试过的组。
+- **R8-6**（"smart: Record member health in the audit trail"）。审计新增 `health` 记录：判死（`to` 为 down，组腿的 `failed` 带错误）、复活（up）、切网（reset，不带组）。
+
+正文中不再成立的五处：
+
+1. **§5.1 表 A 行"拨号失败 / `errLegTimedOut` → 判死成员"。** 现在只有 `errLegTimedOut`（腿被黑洞）当场判死、再做确认；其他即时失败（连接被拒、池里的连接空闲时已死、握手断开）先跑确认探测，由探测的结论判死；本端关闭（`ErrClosedLocally`）和调用方放弃（Canceled，或不是 `errLegTimedOut` 的 DeadlineExceeded）什么都不做。见 `reportFailure`。
+2. **§5.2 "`markDown` 对任何非 `context.Canceled` 的错误都判死"，以及其后裁决顺序第 2 条"按既有语义判死"。** 现在 `ErrClosedLocally`（R7-8）和 `ErrStreamRefused`（R3-8）也豁免，二者都不是关于成员的读数。
+3. **§2.4 "删掉 `Local()`"没有执行。** `ConnMeasurement.Local()` 仍在：`NearHop()` 直接调用它，`smart_member.go` 也在用。它的注释仍说跨链时覆盖到最内层代理，这正是 §2.4 判为错误的推理；`RoundTrip − ServerSpan` 实际只到第一跳。
+4. **§3.3(c) 和 §6 说 `collectStragglers` 要补的洞"只剩出口的 DNS"。** 修订 7 之后 `RemoteDial` 取 `ConnectAck.DestinationLeg()`（Connect + Resolve），出口的解析耗时已经在 remote 里，这个说法不再成立。`collectStragglers`（`smart_race.go`）和 `waitUntil`（`smart_decision.go`）上方的代码注释也还是旧说法，待改。
+5. **§3.3(c) 的 `waitUntil` 模型只有 local + remote。** 现在每个候选的截止时间还要加上该组最近一次的建连成本 `candidate.setupAllowance`，冷池的组不会因为握手慢被判迟到。
+
+**修订 15（第 24 轮）—— 中转把下一跳的建连耗时从上报的 span 里扣掉。**
+中转（腿：naive 入站 → naive 出站）上报的 span 是墙钟时间。它到下一跳的流若要等一个新会话（TCP + TLS + HTTP/2，约两个往返），这段握手也算在 span 里；core 把它记进 chain 窗，而 `rollingCost` 八个样本只丢最差的一个，一次并发突发带来的几个冷样本就把 chain 抬高、触发换组（第 24 轮测试机实测：hk1 的 chain 从 35.6ms 变成 98.1ms，下一条连接切到 sg，出口 IP 随之改变）。现在 `settleFromNextHop` 在下一跳答复之后读出这条流的 `Setup`（cronet 从 Start 到请求头上线），从 Total 里减去再上报；减完若低于 `DestinationLeg()`，客户端的 `Validated` 会丢掉整条读数，这时不减。冷握手于是落进 core 的 near（滚动最小值，自然丢掉），与 core 自己的建连不计入 RoundTrip 是同一口径。线上格式不变：旧 core 读新腿只是 span 变小，新 core 读旧腿就是原来的行为。两处限制：只扣本跳自己的，多级中转里更深一跳的冷握手藏在下一跳的答复时间里，本跳分不出来，仍留在 chain；中转的出站若是 smart，`replayConn` 不实现 `MeasuredConn`，也不扣。
+
+**修订 16（第 24 轮 · 推翻 §4.3 一条否决，并补一处排序）—— 重启后空 chain 窗把中转当成贴着 core。**
+
+现象（测试机实测）：chain 窗只在内存里，重启后每个成员都是空窗，按 §2.6「空窗按 0」算 local。生产的 core 上每个成员都经回环腿出去，near 全是 0.05–0.5ms，组间距离全在 chain 里，于是没跑过三次真实穿链的远组看起来最近：回退（竞速名额满时被推迟的连接）和没有 TCP 快照的 UDP 都送到最远的组，首字节 483ms 与 153ms（正常 38ms）。远组要赢下三次竞速才有 chain，而它们恰恰最不容易赢。
+
+两处改动：
+
+1. `fallbackGroup`：候选里只要有一个 chain 已测且 ≥ `chainProbeFloor`（说明这是中转部署），chain 未测的候选就排在所有已测候选之后（排后，不是剔除：已测的都没有 local 时，未测的仍按静态界排序）。`local()` 本身不变，§2.6 的理由仍然成立。
+2. `probeTarget`：chain 未测满三个样本的成员也打真实地址。启动后的 warmup 和接下来两轮心跳（空闲成员）都打真实地址，之后没有内部的成员退回 `.probe.arpa`，中转由 `relayed()` 接着打真实地址。
+
+这推翻了 §0 与 §4.3 的「明确不做 warmup 首遍改真实地址」。当时的两条理由：(a) 一个 1.1.1.1 不通的部署会在启动时把所有成员判死、永久出局 —— 已经不成立：修订 5 之后真实地址探测问两个独立地址，两个都失败才判死，而判死成员的复活探测本来就打真实地址；(b) 每个直连成员每次启动都向外发包，构成启动指纹 —— 仍然成立，代价是每个成员每次启动三次真实地址探测，接受。§4.1 表第一行相应改为：未分类为中转、且 chain 已测满三个样本的成员才打 `.probe.arpa`。
+
+**修订 17（第 24 轮）—— 心跳跳过窗从 60 秒改为 30 秒。** 轮距 60±20 秒、跳过「60 秒内用过」的成员，最坏静默 59 + 80 = 139 秒，超过中继 120 秒的空闲超时，选中成员上停两分钟后的第一个请求要多付新会话的两个往返（测试机实测 111.8ms 对 39ms）。30 + 80 = 110，等于池信任空闲会话的时长。§4.4 第 1 条的「跳过近期承载流量的成员」仍然成立，只是「近期」变短，忙成员每分钟最多多一次心跳。
+
+**修订 18（第 25 轮）—— 已缓存目标的打分也不让未测的内部抢位。** 修订 16 只改了 `fallbackGroup`；`selectGroup` 仍按「空窗按 0」打分，重启后先测到 chain 的组（hk，35ms）被 chain 未测、看起来贴着 core 的组（jp，实际 50ms）按分数挑战掉，已缓存在 hk 的目标换到 jp，等 jp 测满三个样本再换回，出口地址换两次（测试机审计：`switch hk→jp reason score`，jp local 288µs）。现在中转部署下（判断同修订 16），chain 未测的候选不能挑战别的组，只能守住它已在的位置；全部未测时行为不变，结果为空时调用方照旧去竞速。
+
+**修订 19（第 26 轮）—— 竞速探测带上调用方的 ClientHello。** 新目标的竞速不再让调用方在 `DialContext` 里等：领跑连接立刻拿到一个 `raceConn`，竞速在后台跑。调用方的第一次写先缓存；它恰好是一整条不带 early_data 的 ClientHello 时，每个探测一建好就把它写上去，所以竞速决出时胜者的 ServerHello 已经在路上，新目标的首字节省掉竞速之后那一个胜者往返（C26 本机三组：胜者往返 30ms 时 p50 67.6 → 35.0ms；远组胜出时首字节是 max(决出时刻, 胜者应答)，而竞速在胜者应答时就截掉近组，所以实测仍等于已缓存目标：第 27 轮进程内拓扑 90.2 对 171.9ms，已缓存 90.2ms；只有 bonus、近组冷池或 local 未测时决出才晚于 ServerHello）。其余字节、以及 ClientHello 之后的一切，只在决出后发给胜者。刷新竞速、重测和心跳没有调用方，仍不带载荷。中继的出站是 smart 时：`RemoteAck` 先等决出，再转发胜者的应答，CONNECT 状态照旧（全部拒绝 502，否则 503），`raceConn` 和 `replayConn` 一样不实现 `MeasuredConn`，修订 15 的扣减同样不做。竞速探测因此不再是「目的站只看到一次连接尝试」：目的站从每个参赛出口收到同一个 ClientHello，能把这些出口精确关联到同一个客户端，取舍写在 smart.md。心跳和确认探测（§4.4 第 4 条）仍从不发载荷。502 仍是重放许可：ClientHello 停在出口，而且它本身可以重复投递。
+
+**修订 20（第 26 轮）—— warmup 自己测满 chain 窗。** 修订 16 让 chain 未测满三个样本的成员打真实地址，但 warmup 每个成员只探一次，另外两个样本要等接下来两轮心跳（60±20 秒一轮，且只探 30 秒内没用过的成员），所以重启或 reload 后一到两分钟里每个成员 `hasChain=false`，`fallbackGroup` 的 `relays` 判断不成立，没有 TCP 快照的 UDP 按 near 排序，在回环腿的 core 上落到任意组（A26 测试机：reload 后 UDP 走 us 152ms，同时 TCP 走 hk 35.8ms）。现在 warmup 对 chain 仍未测、且这一轮没被判死的成员再探，最多 `medianQuorum` 轮；受 4 个探测槽位约束，几个成员一到两秒内测满。被判死的成员不重复（死成员每轮要付两个冷探测预算），交给复查。修订 16 里「warmup 和接下来两轮心跳」改为「warmup 的三轮」。
+
+**修订 21（第 26 轮）—— UDP 跟随在飞的 TCP 竞速。** 浏览器已知某站支持 h3 时，会对新主机同时发起 TCP 和 QUIC。以前 QUIC 在 `groupFor` 里立刻按静态排名选组，TCP 走竞速胜者，同一站点从两个出口出去。现在 `groupFor` 在没有已测快照、而 `races` 里有这个主机的轮次在飞时，先等 `decided`（受 UDP 拨号的 ctx 约束）再选组。它不覆盖「根本没有 TCP」的主机，那种情形靠修订 20 让静态排名在第一个 UDP 流之前就对。
