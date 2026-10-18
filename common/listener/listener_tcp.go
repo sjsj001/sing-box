@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
@@ -101,6 +102,14 @@ func (l *Listener) loopTCPIn() {
 			}
 			//nolint:staticcheck
 			if netError, isNetError := err.(net.Error); isNetError && netError.Temporary() {
+				var headerError *proxyproto.Error
+				if errors.As(err, &headerError) {
+					// One client's bad PROXY header: temporary so the loop
+					// goes on, but nothing to wait for, or a client sending
+					// garbage would hold every accept up by a second.
+					l.logger.Error(err)
+					continue
+				}
 				if acceptDelay == 0 {
 					acceptDelay = 5 * time.Millisecond
 				} else {

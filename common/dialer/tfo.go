@@ -180,7 +180,11 @@ func (c *slowOpenConn) WriterReplaceable() bool {
 	return c.conn.Load() != nil
 }
 
-func (c *slowOpenConn) NeedHandshake() bool {
+// NeedHandshakeForWrite tells the copy loop to write first, which is what
+// dials: a server-first protocol would otherwise wait for a greeting from a
+// connection not yet made. It is the interface found through Upstream; the
+// deprecated NeedHandshake was asserted directly, and route's trackedConn hid it.
+func (c *slowOpenConn) NeedHandshakeForWrite() bool {
 	return c.conn.Load() == nil
 }
 

@@ -303,6 +303,13 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		ctx, conn = canceler.NewPacketConn(ctx, conn, udpTimeout)
 	}
 	destination := bufio.NewPacketConn(remotePacketConn)
+	if timer, isTimer := conn.(*canceler.TimerPacketConn); isTimer {
+		// A connection without read deadlines (UoT over a naive HTTP/2
+		// stream) gets a timer that only cancels ctx, and neither copy below
+		// watches ctx: the session outlived its udp_timeout until the far
+		// end closed it.
+		context.AfterFunc(ctx, func() { common.Close(timer, destination) })
+	}
 	var done atomic.Bool
 	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
@@ -317,20 +324,34 @@ func (m *ConnectionManager) deleteURLTestHistory(chain []adapter.Outbound) {
 	}
 }
 
+// tcpCopyBatchSize is how many buffers a vectorised read may fill at once.
+//
+// After DefaultIncreaseBufferAfter (512 KB) a source that is a socket of its
+// own switches to vectorised reads, and the batch's buffers stay allocated
+// for as long as the copy runs, idle included: at sing's default of 8 that is
+// 8×32 KiB held by every long-lived download relayed straight from a socket
+// — measured at 48.5 MB for 200 idle snell→direct connections. Two measured
+// the same CPU as eight (0.29–0.34 s/GB for a snell v5 download, within
+// noise) and holds two.
+const tcpCopyBatchSize = 2
+
 func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, tcpCopyBatchSize)
 	if err != nil {
 		common.Close(source, destination)
 	} else {
 		destinationWriter, _ := N.UnwrapCountWriter(destination, nil)
 		duplexDst, isDuplex := N.UnwrapWriter(destinationWriter).(N.WriteCloser)
-		if isDuplex {
-			err = duplexDst.CloseWrite()
-			if err != nil {
-				common.Close(source, destination)
-			}
-		} else {
+		if !isDuplex {
 			destination.Close()
+		} else if err = duplexDst.CloseWrite(); errors.Is(err, errors.ErrUnsupported) {
+			// A wrapper the unwrapping stops at, over something that cannot
+			// half-close, as smart's replayConn may be: the same as having no
+			// CloseWrite, not an error.
+			err = nil
+			destination.Close()
+		} else if err != nil {
+			common.Close(source, destination)
 		}
 	}
 	if done.Swap(true) {
@@ -433,7 +454,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyPacket(destination, source)
+	_, err := bufio.CopyPacket(destination, batchCappedPacketReader{source})
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")

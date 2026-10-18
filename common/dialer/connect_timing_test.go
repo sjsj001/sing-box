@@ -162,3 +162,39 @@ func TestARelayWhoseNextHopIsTooOldToReportOneReportsNothing(t *testing.T) {
 	_, hasResolve := timing.Resolution()
 	require.False(t, hasResolve)
 }
+
+func TestALookupBeforeTheDialCountsAsFindingTheDestination(t *testing.T) {
+	t.Parallel()
+	// A route rule resolved the destination and the dial was handed an
+	// address. The lookup is outside the dial, so the connect keeps its value,
+	// and it is what finding the destination cost — left out, it was charged
+	// to the node instead.
+	_, timing := WithConnectTiming(context.Background())
+	timing.RecordResolution(30 * time.Millisecond)
+	timing.RecordDial(60 * time.Millisecond)
+	timing.RecordDNS(10 * time.Millisecond)
+	_, connect, hasConnect, ok := timing.Spans()
+	require.True(t, ok)
+	require.True(t, hasConnect)
+	require.Equal(t, 50*time.Millisecond, connect)
+	resolve, hasResolve := timing.Resolution()
+	require.True(t, hasResolve)
+	require.Equal(t, 40*time.Millisecond, resolve)
+}
+
+func TestARelaysOwnLookupOfTheDestinationIsPassedOn(t *testing.T) {
+	t.Parallel()
+	// On a relay that resolved the destination itself, the next hop was handed
+	// an address and found it for free; this lookup is the one that found it.
+	_, timing := WithConnectTiming(context.Background())
+	timing.RecordResolution(30 * time.Millisecond)
+	timing.RecordDial(45 * time.Millisecond)
+	timing.RecordInnerAck(8 * time.Millisecond)
+	resolve, hasResolve := timing.Resolution()
+	require.True(t, hasResolve, "even from a next hop too old to report one")
+	require.Equal(t, 30*time.Millisecond, resolve)
+
+	timing.RecordInnerResolution(5 * time.Millisecond)
+	resolve, _ = timing.Resolution()
+	require.Equal(t, 35*time.Millisecond, resolve)
+}

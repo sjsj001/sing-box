@@ -34,10 +34,13 @@ type ConnectTiming struct {
 	// a total smaller than the connect time it was supposed to contain — which
 	// is impossible, and which a client subtracting it from its own round trip
 	// reads as this hop being infinitely close.
-	start        time.Time
-	total        time.Duration
-	dial         time.Duration
-	dns          time.Duration
+	start time.Time
+	total time.Duration
+	dial  time.Duration
+	dns   time.Duration
+	// preDNS is lookups made before the dial — a route rule resolving the
+	// destination — which the dial span does not contain.
+	preDNS       time.Duration
 	inner        time.Duration
 	innerDNS     time.Duration
 	haveTotal    bool
@@ -106,6 +109,21 @@ func (t *ConnectTiming) RecordDNS(lookup time.Duration) {
 	}
 }
 
+// RecordResolution stores a lookup made before the dial: a route rule
+// resolving the destination, so the dial is handed an address. It is not
+// inside the dial span, so nothing is taken out of the connect; it is added to
+// what finding the destination cost. Lookups add up, since more than one rule
+// may resolve. Left out, an exit that resolves this way reported finding the
+// destination as free, and a cold lookup was charged to the node instead.
+func (t *ConnectTiming) RecordResolution(lookup time.Duration) {
+	if t == nil {
+		return
+	}
+	t.access.Lock()
+	defer t.access.Unlock()
+	t.preDNS += lookup
+}
+
 // RecordInnerAck stores the connect time the next hop reported, which is what a
 // relay passes through as its own. First write wins.
 func (t *ConnectTiming) RecordInnerAck(connect time.Duration) {
@@ -144,12 +162,16 @@ func (t *ConnectTiming) RecordInnerResolution(resolve time.Duration) {
 // which is the part of a hop's work that belongs to the destination rather than
 // to the hop.
 //
-// On a relay it is whatever the next hop reported, unchanged. Otherwise it is
-// this hop's own lookup, and it is reported even when zero — that is a real
-// claim, not an absence: the destination was already known, or was an address
-// to begin with. Reported alongside a dial rather than on its own, because the
-// invariant a client relies on is connect + resolve = dial, and there is no
+// On a relay it is whatever the next hop reported. Otherwise it is this hop's
+// own lookup, and it is reported even when zero — that is a real claim, not an
+// absence: the destination was already known, or was an address to begin
+// with. Reported alongside a dial rather than on its own, because what a
+// client relies on is connect + resolve covering the dial, and there is no
 // dial to hold that up without one.
+//
+// Lookups a route rule made before the dial are added on both. On a relay they
+// are the ones that found the destination: the next hop was handed an address
+// and reports finding it as nothing.
 func (t *ConnectTiming) Resolution() (time.Duration, bool) {
 	if t == nil {
 		return 0, false
@@ -157,12 +179,15 @@ func (t *ConnectTiming) Resolution() (time.Duration, bool) {
 	t.access.Lock()
 	defer t.access.Unlock()
 	if t.relay {
-		return t.innerDNS, t.haveInnerDNS
+		if !t.haveInnerDNS && t.preDNS == 0 {
+			return 0, false
+		}
+		return t.innerDNS + t.preDNS, true
 	}
 	if !t.haveDial || t.dial < t.dns {
 		return 0, false
 	}
-	return t.dns, true
+	return t.dns + t.preDNS, true
 }
 
 // Spans reports the two wire values. hasConnect is false when nothing usable is

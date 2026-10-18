@@ -11,6 +11,8 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/interrupt"
+
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/sniff"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -1066,6 +1068,7 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 				return E.New("DNS server not found: ", action.Server)
 			}
 		}
+		lookupStart := time.Now()
 		addresses, err := r.dns.Lookup(adapter.WithContext(ctx, metadata), metadata.Destination.Fqdn, adapter.DNSQueryOptions{
 			Transport:              transport,
 			Strategy:               action.Strategy,
@@ -1078,6 +1081,9 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 		if err != nil {
 			return err
 		}
+		// What finding the destination cost, for a hop that reports it to a
+		// client ranking exits; the dial that follows is handed an address.
+		dialer.ConnectTimingFromContext(ctx).RecordResolution(time.Since(lookupStart))
 		if action.MatchOnly {
 			metadata.CacheIPs = addresses
 			r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.CacheIPs), " "), "] for match only")
