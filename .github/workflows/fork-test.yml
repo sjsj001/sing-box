@@ -1,0 +1,35 @@
+name: Fork tests
+
+# test.yml runs on upstream's release branches only, and without the naive
+# tags, so nothing ran the tests of this fork's own code. This runs them, on
+# one system, against the cronet-go fork the release build uses.
+on:
+  push:
+    branches:
+      - main
+      - 'opt-*'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          fetch-depth: 1
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.9
+      - name: Use the cronet-go fork
+        run: bash .github/inject_cronet_fork.sh
+      - name: Test
+        run: go test -race -tags with_quic,with_naive_outbound,with_purego ./protocol/group/ ./protocol/naive/... ./common/dialer/ ./common/interrupt/ ./common/listener/ ./route/ ./experimental/cachefile/
+      # make test sets no tags, and a test file that needed one once broke the
+      # whole test module that way.
+      - name: Vet without tags
+        run: |
+          go vet ./common/dialer/ ./common/interrupt/ ./common/listener/ ./route/ ./experimental/cachefile/
+          cd test && go vet .
