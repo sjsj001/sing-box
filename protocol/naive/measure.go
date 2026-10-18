@@ -158,15 +158,6 @@ func (m ConnMeasurement) Validated() ConnMeasurement {
 	return m
 }
 
-// PooledOutbound is implemented by outbounds that spread their streams over
-// several isolated connection pools, so a caller that wants none of them cold
-// knows how many connections that takes.
-type PooledOutbound interface {
-	// Pools reports how many isolated pools streams are spread over. It is
-	// always at least one.
-	Pools() int
-}
-
 // PayloadCarrier is implemented by outbound connections that can report whether
 // any payload has been handed to the tunnel. A connection that never carried
 // payload can have its opening write replayed elsewhere without the

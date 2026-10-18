@@ -6,11 +6,13 @@ package group
 // nothing here talks to the network.
 
 import (
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
@@ -23,6 +25,12 @@ type smartGroup struct {
 	selectFastest bool
 	members       []*smartMember
 	selected      atomic.Pointer[smartMember]
+	// guessed is the member last picked with nothing measured, which
+	// "fastest" does not hold in place for having been picked. A member rather
+	// than a flag, so it cannot come apart from selected under concurrent
+	// callers: whatever ends up selected, it is held unless it is this one.
+	// See current.
+	guessed atomic.Pointer[smartMember]
 	// onMemberChange is how a member swap reaches the audit trail. It is a
 	// callback rather than a back-reference so the group stays something the
 	// decision tests can build on its own.
@@ -119,6 +127,46 @@ type smartMember struct {
 	// line does not alternate between two kinds of probe.
 	chained atomic.Bool
 	healthy atomic.Bool
+	// refused records that this member answered 502 for a real destination
+	// since its last heartbeat. A 502 is filed against the destination, but an
+	// exit whose own egress is gone answers 502 for everything — and its probe
+	// address keeps answering, so only a real address can tell the two apart.
+	// The next heartbeat consumes it; see probeTarget.
+	refused atomic.Bool
+	// downAt is when this member was last condemned, in nanoseconds. See
+	// Smart.refusedByCondemned.
+	downAt atomic.Int64
+	// previousDownAt is the condemnation before downAt, which is all the
+	// history the flap hold needs: two condemnations close together. See
+	// smartMember.heldDown. Written before downAt, so a reader that sees a new
+	// downAt also sees the previousDownAt that goes with it.
+	previousDownAt atomic.Int64
+	// deliveredAt is when a connection through this member last read payload,
+	// in nanoseconds. It is what tells a congested member from a dead one: a
+	// path saturated by a bulk download leaves new streams unanswered for tens
+	// of seconds while the download itself keeps arriving. See
+	// Smart.congested.
+	deliveredAt atomic.Int64
+	// congested keeps "congested, not condemning" to one line per episode. Set
+	// when a probe's silence is excused, cleared when a probe is answered again
+	// or the member is condemned.
+	congested atomic.Bool
+	// suspectedAt is when a settle that hung last spent a confirming probe on
+	// this member, in nanoseconds. See Smart.suspect.
+	suspectedAt atomic.Int64
+	// refusalProbedAt is when a run of refusals last spent a confirming probe
+	// on this member, in nanoseconds. See Smart.reportFailure.
+	refusalProbedAt atomic.Int64
+	// refusedKeys are the destinations this member has refused since anything
+	// went through it, newest last, guarded by access. See
+	// smartMember.noteRefusal.
+	refusedKeys []refusal
+	// udp holds the UDP flows this member carries, so condemning it can end
+	// them. A UDP flow is not re-decided per packet: an application sending on
+	// one socket — WireGuard, a call, a game — stayed on a member that had
+	// been condemned for as long as it kept sending, and only a new flow
+	// would be placed elsewhere.
+	udp interrupt.Group
 	// lastUsed is when this member last completed a measurement for traffic —
 	// a race probe or a connection the caller is holding. It is what lets the
 	// heartbeat skip busy members, so a heartbeat's own measurement is
@@ -137,9 +185,74 @@ type smartMember struct {
 	// node dying under load produces one probe rather than one per connection
 	// that noticed. See Smart.confirmDown.
 	probing atomic.Bool
+	// outwaiting is probing for the long probe a congestion episode starts.
+	// Its own flag, so the thirty seconds it may take hold up no confirming
+	// probe. See Smart.outwait.
+	outwaiting atomic.Bool
 	// unsupported keeps the "this server has no smart extension" warning to one
 	// line rather than one per heartbeat, forever.
 	unsupported sync.Once
+}
+
+// refusal is one destination a member refused, and when.
+type refusal struct {
+	key string
+	at  int64
+}
+
+// noteDelivered stamps that a connection through this member just read
+// payload. Every read of every connection lands here, so the store is skipped
+// while the stamp is fresher than deliveryStampInterval: the reads of a busy
+// member would otherwise contend on one cache line for a reading that only
+// has to be good to a fraction of congestionGrace.
+func (m *smartMember) noteDelivered() {
+	now := time.Now().UnixNano()
+	if now-m.deliveredAt.Load() >= int64(deliveryStampInterval) {
+		m.deliveredAt.Store(now)
+	}
+}
+
+// delivering reports whether a connection through this member read payload
+// within congestionGrace.
+func (m *smartMember) delivering(now time.Time) bool {
+	return now.UnixNano()-m.deliveredAt.Load() < int64(congestionGrace)
+}
+
+// heldDown reports whether this member is serving a flap hold: condemned at
+// least twice within flapWindow, and the latest less than hold ago.
+//
+// Two stamps are enough to answer that, because the question is only ever
+// whether the condemnation that took it out came soon after the one before.
+// Read downAt first: previousDownAt is written first, so the pair read this
+// way is never a new downAt with a stale predecessor.
+func (m *smartMember) heldDown(now time.Time, hold time.Duration) bool {
+	downAt := m.downAt.Load()
+	previous := m.previousDownAt.Load()
+	return previous != 0 && downAt-previous <= int64(flapWindow) && now.UnixNano() < downAt+int64(hold)
+}
+
+// noteRefusal records that this member refused a destination, and reports
+// when it has now refused refusalBurst different ones within refusalWindow
+// with nothing getting through in between — which is what an exit that has
+// lost its own egress looks like, and nothing else does for long. The run
+// starts over once it has been reported, and whenever traffic gets through
+// (see recordMeasurement).
+func (m *smartMember) noteRefusal(key string, now time.Time) bool {
+	at := now.UnixNano()
+	m.access.Lock()
+	defer m.access.Unlock()
+	kept := m.refusedKeys[:0]
+	for _, refused := range m.refusedKeys {
+		if refused.key != key && at-refused.at < int64(refusalWindow) {
+			kept = append(kept, refused)
+		}
+	}
+	m.refusedKeys = append(kept, refusal{key: key, at: at})
+	if len(m.refusedKeys) < refusalBurst {
+		return false
+	}
+	m.refusedKeys = nil
+	return true
 }
 
 // supportsUDP reports whether this member can carry UDP at all — naive only
@@ -150,28 +263,6 @@ func (m *smartMember) supportsUDP() bool {
 
 func (m *smartMember) setup() time.Duration {
 	return time.Duration(m.lastSetup.Load())
-}
-
-// warmupDials is how many connections it takes to leave none of this member's
-// pools cold.
-//
-// naive balances each new stream onto its least-loaded pool, so this many
-// concurrent dials reach every pool when the pools sit evenly loaded — which
-// between warmups they do. The count is live: an adaptive member reports the
-// pools demand has actually opened, a fixed one its configured constant.
-// Fewer dials leaves some pools cold and the handshake lands on whichever
-// probe draws one; more lands the extra dials back on pools that are already
-// warm.
-func (m *smartMember) warmupDials() int {
-	pooled, isPooled := common.Cast[naive.PooledOutbound](m.outbound)
-	if !isPooled {
-		return 1
-	}
-	dials := pooled.Pools()
-	if dials < 1 {
-		return 1
-	}
-	return min(dials, warmupDialsMax)
 }
 
 // local is this client to the innermost proxy: the near hop plus whatever the
@@ -266,6 +357,14 @@ func (m *smartMember) relayed() bool {
 // derived at all until the new network has been measured.
 func (m *smartMember) resetPath() {
 	m.lastSetup.Store(0)
+	// Payload that arrived over the old path says nothing about the new one,
+	// and left standing it would excuse a member the new network cannot reach
+	// from the first probe round after the change; see Smart.congested.
+	m.deliveredAt.Store(0)
+	// Condemnations on the old path say nothing about flapping on this one: a
+	// phone condemned twice on a bad Wi-Fi was held out for a minute after
+	// moving to cellular.
+	m.previousDownAt.Store(0)
 	m.access.Lock()
 	defer m.access.Unlock()
 	m.window = rollingMin{}
@@ -317,6 +416,7 @@ func (m *smartMember) readyTimeout() (time.Duration, bool) {
 // record banks a measurement and says so when the floor had to override what
 // the proxy reported.
 func (s *Smart) record(member *smartMember, measurement naive.ConnMeasurement) {
+	s.markUp(member)
 	reported, floor, corrected := member.record(measurement)
 	s.reportCorrection(member, reported, floor, corrected)
 }
@@ -326,8 +426,94 @@ func (s *Smart) record(member *smartMember, measurement naive.ConnMeasurement) {
 func (s *Smart) recordProbe(member *smartMember, destination M.Socksaddr, measurement naive.ConnMeasurement) {
 	// The heartbeat address never leaves the proxy, so it has nothing to say
 	// about what lies beyond it. Anything else the probe was pointed at does.
+	s.markUp(member)
+	// A probe answered in time, so whatever silence was excused as congestion
+	// is over; the next one excused starts a new episode, and says so. Not one
+	// to the proxy's own address: the proxy answers it without dialing, so it
+	// says nothing about the exit whose silence began the episode, and ending
+	// the episode on it dropped the long probe's verdict on an exit that had
+	// stopped answering new connections.
+	if member.congested.Load() && !naive.IsProbe(destination) {
+		member.congested.Store(false)
+	}
 	reported, floor, corrected := member.recordProbe(measurement, !naive.IsProbe(destination))
 	s.reportCorrection(member, reported, floor, corrected)
+}
+
+// markUp says so when a measurement lets a condemned member back in. Every way
+// back goes through record or recordProbe — traffic, a race, a retake, a
+// heartbeat — and said only by the heartbeat, a run of "is unreachable" from an
+// outage stood unanswered in the log after traffic had quietly brought every
+// member back. The swap is what makes it once, and it is the only way back:
+// a second store after it would let a heartbeat condemning the member in
+// between be undone without a word.
+//
+// Being the only way back, it is also where the flap hold is kept. A member
+// that has been condemned twice within flapWindow is not let back in until
+// flapHold has passed since the latest condemnation, whatever answers in the
+// meantime: every readmission moves each destination on its group to a
+// different exit address and back again, and a node that keeps dropping out
+// was doing that to them every few minutes. condemn lands a probe at the end
+// of the hold, so the hold is what it costs and not the heartbeat after it.
+// See holding for when it applies.
+func (s *Smart) markUp(member *smartMember) {
+	if member.healthy.Load() {
+		return
+	}
+	if s.holding(member, time.Now()) {
+		return
+	}
+	if member.healthy.CompareAndSwap(false, true) {
+		s.logger.Info("member ", member.tag, " is reachable again")
+		s.auditHealth(member, "up", nil)
+	}
+}
+
+// holding reports whether the flap hold keeps member out now.
+//
+// It applies to traffic as much as to probes, with two exceptions that cover
+// both. It is lifted when nothing else in this outbound is up. Traffic only
+// reaches a condemned member then anyway — candidates offers what is down when
+// nothing is up — and with nothing to fall back on there is no flap to damp.
+// Keeping it down there would cost more than availability: a group whose
+// members are all down hands out its first member, so a held member that is
+// answering would sit behind a dead one for the whole hold.
+//
+// Nor does it apply when a member of another group was condemned within
+// flapCommonCause of this one's latest condemnation. Two groups' exits do not
+// fail together; this end's uplink dropping takes out every member carrying
+// traffic at once. Read as flapping, a second short outage within ten minutes
+// held all of them out but the first one back, or all but an idle backup the
+// outage had missed, and moved every destination to another exit and back —
+// the very thing the hold exists to prevent.
+func (s *Smart) holding(member *smartMember, now time.Time) bool {
+	if !member.heldDown(now, s.flapHold()) || !s.anotherUp(member) {
+		return false
+	}
+	downAt := member.downAt.Load()
+	for _, group := range s.groups {
+		if slices.Contains(group.members, member) {
+			continue
+		}
+		for _, other := range group.members {
+			if gap := other.downAt.Load() - downAt; gap > -int64(flapCommonCause) && gap < int64(flapCommonCause) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// anotherUp reports whether any member other than this one is up.
+func (s *Smart) anotherUp(member *smartMember) bool {
+	for _, group := range s.groups {
+		for _, other := range group.members {
+			if other != member && other.healthy.Load() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Smart) reportCorrection(member *smartMember, reported time.Duration, floor time.Duration, corrected bool) {
@@ -382,9 +568,9 @@ func (m *smartMember) record(measurement naive.ConnMeasurement) (reported time.D
 // alone, because a heartbeat is not the member being used.
 //
 // lastUsed is what heartbeatRound reads to skip members that carried traffic
-// recently. Stamped by the heartbeat itself, it suppresses the round after a
-// probe about half the time: the interval is 60s with 20s of jitter, so an
-// idle member ends up probed at around 90s instead of 60s — cold for exactly
+// recently. Stamped by the heartbeat itself, it suppressed the round after a
+// probe about half the time when the skip window was the whole interval, so an
+// idle member ended up probed at around 90s instead of 60s — cold for exactly
 // the failover that reaches for it. The request counters already exclude
 // probes for the same reason: this outbound's own traffic must not make a
 // member look busy. Every probe path shares this — warmup, the probe round
@@ -394,14 +580,19 @@ func (m *smartMember) recordProbe(measurement naive.ConnMeasurement, traversed b
 }
 
 func (m *smartMember) recordMeasurement(measurement naive.ConnMeasurement, used bool, traversed bool) (reported time.Duration, floor time.Duration, corrected bool) {
-	// Reaching the proxy at all proves it is alive, whatever it chose to report.
+	// Reaching the proxy at all proves it is alive, whatever it chose to report;
+	// Smart.markUp, on the way in, is what says so.
 	m.lastSetup.Store(int64(measurement.Setup))
-	m.healthy.Store(true)
 	if used {
 		m.lastUsed.Store(time.Now().UnixNano())
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
+	if used && len(m.refusedKeys) > 0 {
+		// Something got through, so whatever was refused before it was about
+		// those destinations and not about this exit's egress.
+		m.refusedKeys = nil
+	}
 	if measurement.Setup >= coldSetupFloor {
 		m.setupWindow.add(measurement.Setup)
 	}
@@ -472,12 +663,28 @@ func (g *smartGroup) current() *smartMember {
 			best, bestLocal = member, local
 		}
 	}
-	if best == nil {
-		// Nothing measured yet: fall back rather than refuse to dial.
-		return g.record(g.firstHealthy(), reasonFallback)
-	}
-
+	// After a network change every member is unmeasured again, and the member
+	// in use is still the one that won on measurement. Falling back to the
+	// first member then moved every destination's exit address, and once both
+	// were measured again the hysteresis held the group on whichever had been
+	// picked blind. So a healthy incumbent that won on a measurement is kept
+	// until it has been measured again; one that was itself picked blind holds
+	// nothing — a member that can never be measured would otherwise keep it
+	// for good.
 	incumbent := g.selected.Load()
+	held := incumbent != nil && incumbent.healthy.Load() && incumbent != g.guessed.Load()
+	if best == nil {
+		if held {
+			return incumbent
+		}
+		// Nothing measured yet: fall back rather than refuse to dial.
+		first := g.firstHealthy()
+		g.guessed.Store(first)
+		return g.record(first, reasonFallback)
+	}
+	// Picked on a measurement now, whatever it was picked on before.
+	g.guessed.CompareAndSwap(best, nil)
+
 	if incumbent != nil && incumbent != best {
 		if !incumbent.healthy.Load() {
 			// Not a change of mind. The member in use was condemned and this is
@@ -489,7 +696,7 @@ func (g *smartGroup) current() *smartMember {
 			// place: it did that here before this line existed.
 			return g.record(best, reasonFailover)
 		}
-		if local, measured := incumbent.local(); measured && bestLocal > local-switchHysteresis {
+		if local, measured := incumbent.local(); held && (!measured || bestLocal > local-switchHysteresis) {
 			return incumbent
 		}
 	}
@@ -504,7 +711,9 @@ func (g *smartGroup) current() *smartMember {
 // fails, which schedules an immediate confirming probe. Either way the group
 // recovers on the next request. Returning nothing instead would make recovery
 // wait for the next heartbeat round, so a blip that briefly knocked out every
-// member would keep failing traffic long after the network came back.
+// member would keep failing traffic long after the network came back. Since
+// candidates leaves a group like this out while another is up, this now only
+// decides anything when nothing is.
 func (g *smartGroup) firstHealthy() *smartMember {
 	for _, member := range g.members {
 		if member.healthy.Load() {
@@ -517,6 +726,16 @@ func (g *smartGroup) firstHealthy() *smartMember {
 	return nil
 }
 
+// down reports whether every member of the group is condemned.
+func (g *smartGroup) down() bool {
+	for _, member := range g.members {
+		if member.healthy.Load() {
+			return false
+		}
+	}
+	return true
+}
+
 // record notes the member the group is using, announcing it when that is a
 // change.
 //
@@ -525,8 +744,11 @@ func (g *smartGroup) firstHealthy() *smartMember {
 // site as a group change and exactly as invisible in a log that only records
 // group choices.
 func (g *smartGroup) record(member *smartMember, reason string) *smartMember {
-	if member == nil {
-		return nil
+	if member == nil || g.selected.Load() == member {
+		// Swapping in the member already there changes nothing and announces
+		// nothing, so it is a load; the swap wrote a shared line on every
+		// connection.
+		return member
 	}
 	previous := g.selected.Swap(member)
 	if previous != nil && previous != member && g.onMemberChange != nil {

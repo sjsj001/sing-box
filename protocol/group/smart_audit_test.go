@@ -4,13 +4,18 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/naive"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -173,8 +178,24 @@ func TestATrailThatCannotBeWrittenDoesNotStopTraffic(t *testing.T) {
 	for range 3 {
 		audit.write(auditRecord{Time: time.Now(), Type: auditTypeSwitch})
 	}
-	require.True(t, audit.broken, "it gives up rather than retrying on every decision")
+	audit.settle()
+	require.False(t, audit.brokenAt.IsZero(), "it rests rather than retrying on every decision")
+
+	// A full disk or a missing directory is usually temporary. Once the rest
+	// is over the trail picks up again, instead of staying off until restart.
+	require.NoError(t, os.MkdirAll(filepath.Dir(audit.path), 0o700))
+	audit.write(auditRecord{Time: time.Now(), Type: auditTypeSwitch})
+	audit.settle()
+	require.NoFileExists(t, audit.path, "not before the rest is over")
+	audit.brokenAt = time.Now().Add(-auditRetryAfter)
+	audit.write(auditRecord{Time: time.Now(), Type: auditTypeSwitch})
+	audit.settle()
+	require.Len(t, readTrail(t, audit.path), 1)
+
 	require.NoError(t, audit.Close())
+	audit.brokenAt = time.Time{}
+	audit.write(auditRecord{Time: time.Now(), Type: auditTypeSwitch})
+	require.Len(t, readTrail(t, audit.path), 1, "and nothing is written once it is closed")
 }
 
 func TestNoTrailIsKeptUnlessOneIsAskedFor(t *testing.T) {
@@ -417,4 +438,234 @@ func TestAClosedTrailStaysClosed(t *testing.T) {
 	audit.access.Lock()
 	defer audit.access.Unlock()
 	require.Nil(t, audit.file, "and must not have reopened it")
+}
+
+func TestTheDumpsNameTheDestinationsInUseRatherThanTheFirstEverSeen(t *testing.T) {
+	t.Parallel()
+	// The names used to stop at the first 16384 destinations a process saw.
+	// After a few weeks the table the dumps describe held none of them.
+	audit := newSmartAudit(context.Background(), logger.NOP(), filepath.Join(t.TempDir(), "audit.jsonl"), 0)
+	audit.note("kept", "kept.example.com:443")
+	for i := range destinationCacheSize {
+		audit.note(fmt.Sprint(i), fmt.Sprint("site", i, ".example.com:443"))
+		if i%1000 == 0 {
+			audit.note("kept", "kept.example.com:443")
+		}
+	}
+	require.Equal(t, "kept.example.com:443", audit.name("kept"), "a destination still in use keeps its name")
+	require.Empty(t, audit.name("0"), "the least recently used goes first")
+	require.Equal(t, fmt.Sprint("site", destinationCacheSize-1, ".example.com:443"),
+		audit.name(fmt.Sprint(destinationCacheSize-1)), "a new destination is named")
+}
+
+type smartOutboundManager struct {
+	adapter.OutboundManager
+	outbounds []adapter.Outbound
+}
+
+func (m *smartOutboundManager) Outbounds() []adapter.Outbound { return m.outbounds }
+
+func TestTwoSmartOutboundsCannotShareAnAuditFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	manager := &smartOutboundManager{}
+	newAudited := func(tag string, file string) *Smart {
+		s := &Smart{
+			Adapter:  outbound.NewAdapter(C.TypeSmart, tag, nil, nil),
+			outbound: manager,
+			audit:    newSmartAudit(context.Background(), logger.NOP(), filepath.Join(dir, file), 0),
+		}
+		manager.outbounds = append(manager.outbounds, s)
+		return s
+	}
+	first := newAudited("first", "trail.jsonl")
+	newAudited("second", "trail.jsonl")
+	third := newAudited("third", "other.jsonl")
+	require.ErrorContains(t, first.sharedAuditPath(), "share audit_path")
+	require.NoError(t, third.sharedAuditPath())
+
+	// A replacement of the same tag is constructed while the outbound it
+	// replaces is still listed: the same file, but not a second writer.
+	replacement := &Smart{
+		Adapter:  outbound.NewAdapter(C.TypeSmart, "third", nil, nil),
+		outbound: manager,
+		audit:    newSmartAudit(context.Background(), logger.NOP(), filepath.Join(dir, "other.jsonl"), 0),
+	}
+	require.NoError(t, replacement.sharedAuditPath())
+}
+
+func TestAMemberGoingDownAndComingBackIsRecorded(t *testing.T) {
+	t.Parallel()
+	// A group out of service for an hour used to leave nothing in the trail
+	// but the down flag on the next hourly dump. Both doors a condemnation
+	// comes through, the way back, and the network change that resets every
+	// member each leave a line.
+	smart, path := auditedSmart(t)
+	member := newMember("out-hk", ms(30))
+	member.probing.Store(true) // no confirming probe; this is about the record
+	group := &smartGroup{tag: "hk", members: []*smartMember{member}}
+	smart.groups = []*smartGroup{group}
+	destination := M.ParseSocksaddr("example.com:443")
+
+	smart.markDown(member, E.New("connection refused"))
+	smart.record(member, answering(ms(30), ms(1)))
+	smart.reportFailure("3f2a", destination, group, member,
+		fmt.Errorf("%w: %w", naive.ErrNextHopUnreachable, errLegTimedOut))
+	smart.recordProbe(member, destination, answering(ms(30), ms(1)))
+	smart.record(member, answering(ms(30), ms(1))) // already up: nothing to say
+	smart.groups = nil                             // nothing for the reset's probe round to dial
+	smart.InterfaceUpdated(context.Background())
+	require.NoError(t, smart.audit.Close())
+
+	records := readTrail(t, path)
+	require.Len(t, records, 5)
+	for _, record := range records {
+		require.Equal(t, auditTypeHealth, record.Type)
+	}
+	require.Equal(t, "down", records[0].To)
+	require.Equal(t, []auditLeg{{Tag: "hk", Member: "out-hk", Failed: "connection refused"}}, records[0].Groups)
+	require.Equal(t, "up", records[1].To)
+	require.Equal(t, []auditLeg{{Tag: "hk", Member: "out-hk"}}, records[1].Groups)
+	require.Equal(t, "down", records[2].To)
+	require.Contains(t, records[2].Groups[0].Failed, errLegTimedOut.Error())
+	require.Equal(t, "up", records[3].To)
+	require.Equal(t, "reset", records[4].To)
+	require.Empty(t, records[4].Groups, "every member, so none named")
+}
+
+func TestADecisionDoesNotWaitForTheDisk(t *testing.T) {
+	t.Parallel()
+	// write sits on the dial path. A disk that takes seconds per write — Linux
+	// writeback throttling, a network mount, a dying flash — held every new
+	// destination's first connection behind the previous one's record: eight
+	// in parallel waited up to sixteen seconds. The record goes to a queue,
+	// and the writer alone waits on the disk.
+	path := filepath.Join(t.TempDir(), "trail.jsonl")
+	audit := newSmartAudit(context.Background(), logger.NOP(), path, auditDefaultSize)
+	audit.access.Lock() // the writer is stuck in a write
+	returned := make(chan struct{})
+	go func() {
+		audit.write(auditRecord{Type: auditTypeRace, Key: "3f2a"})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		audit.access.Unlock()
+		t.Fatal("the decision waited for the disk")
+	}
+
+	// Past the queue's depth the disk is not keeping up, and a record is
+	// dropped and counted rather than waited for. Whether the writer had
+	// already taken the first record off the queue decides whether three or
+	// four of these are over.
+	for i := range auditQueueSize + 3 {
+		audit.write(auditRecord{Type: auditTypeRace, Key: fmt.Sprint(i)})
+	}
+	require.Eventually(t, func() bool { return audit.dropped.Load() >= 3 }, 5*time.Second, time.Millisecond)
+	dropped := int(audit.dropped.Load())
+	require.LessOrEqual(t, dropped, 4)
+	audit.access.Unlock()
+	require.NoError(t, audit.Close(), "and Close writes out what was queued")
+	require.Len(t, readTrail(t, path), auditQueueSize+4-dropped)
+}
+
+func TestAHalfRecordLeftByAFullDiskIsCutOff(t *testing.T) {
+	t.Parallel()
+	// A full disk took part of a record and no newline. In the process the
+	// write is undone on the spot; after a restart the half line is what the
+	// next record would be appended to, making one line nothing can parse and
+	// losing both.
+	path := filepath.Join(t.TempDir(), "trail.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(`{"type":"race","key":"3f2a"}`+"\n"+`{"type":"swi`), 0o600))
+	audit := newSmartAudit(context.Background(), logger.NOP(), path, auditDefaultSize)
+	audit.write(auditRecord{Type: auditTypeSwitch, Key: "later"})
+	require.NoError(t, audit.Close())
+
+	records := readTrail(t, path)
+	require.Len(t, records, 2)
+	require.Equal(t, "3f2a", records[0].Key)
+	require.Equal(t, "later", records[1].Key)
+}
+
+func TestTheLastDumpsWaitForAFullQueue(t *testing.T) {
+	t.Parallel()
+	// Close's usage and state dumps are what the trail ends on and what a
+	// check reconciles against. A queue left full by a slow disk dropped them
+	// like any other record.
+	path := filepath.Join(t.TempDir(), "trail.jsonl")
+	audit := newSmartAudit(context.Background(), logger.NOP(), path, auditDefaultSize)
+	audit.access.Lock() // the writer is stuck in a write
+	// One record in the stuck write, the queue full behind it, and more.
+	for i := range auditQueueSize + 3 {
+		audit.write(auditRecord{Type: auditTypeRace, Key: fmt.Sprint(i)})
+	}
+	require.Eventually(t, func() bool { return audit.dropped.Load() >= 1 }, 5*time.Second, time.Millisecond)
+	audit.finishing()
+	wrote := make(chan struct{})
+	go func() {
+		audit.write(auditRecord{Type: auditTypeState, Key: "last"})
+		close(wrote)
+	}()
+	audit.access.Unlock()
+	<-wrote
+	require.NoError(t, audit.Close())
+	trail := readTrail(t, path)
+	require.Equal(t, "last", trail[len(trail)-1].Key, "the final dump was dropped")
+}
+
+func TestTheLastDumpsAreWrittenWhenTheFlushSpentTheBudget(t *testing.T) {
+	// The budget starts when the outbound begins to close, and the cache
+	// flush before the last dumps has no bound of its own: when it took the
+	// whole budget, the dumps found an expired timer and an empty queue, and
+	// were dropped at random — one of two on average — as lost to a disk that
+	// had nothing to do with it.
+	//
+	// The writer gets more than the 200ms grace here: under -race on one CPU
+	// the other tests' goroutines kept it from running that long and the
+	// last dump was dropped one run in fifteen. Not parallel, so the other
+	// tests never see the longer grace.
+	previous := auditCloseGrace
+	auditCloseGrace = 2 * time.Second
+	t.Cleanup(func() { auditCloseGrace = previous })
+	path := filepath.Join(t.TempDir(), "trail.jsonl")
+	audit := newSmartAudit(context.Background(), logger.NOP(), path, auditDefaultSize)
+	audit.finishing()
+	audit.deadline.Store(time.Now().Add(-time.Second).UnixNano()) // the flush took longer than the budget
+	audit.write(auditRecord{Type: auditTypeUsage})
+	audit.write(auditRecord{Type: auditTypeState, Key: "last"})
+	require.NoError(t, audit.Close())
+	trail := readTrail(t, path)
+	require.Len(t, trail, 2, "the last dumps were dropped although the disk was keeping up")
+	require.Equal(t, "last", trail[1].Key)
+}
+
+func TestClosingGivesUpOnASlowDiskInTime(t *testing.T) {
+	t.Parallel()
+	// The command line kills the process when closing takes ten seconds. A
+	// queue full on a disk slow enough to fill it took that long to drain,
+	// and the kill took the cache flush and every outbound after this one
+	// with it. Closing gives the trail a budget, and what is left after it is
+	// counted as lost.
+	path := filepath.Join(t.TempDir(), "trail.jsonl")
+	audit := newSmartAudit(context.Background(), logger.NOP(), path, auditDefaultSize)
+	audit.access.Lock() // the writer is stuck in a write
+	for i := range auditQueueSize + 3 {
+		audit.write(auditRecord{Type: auditTypeRace, Key: fmt.Sprint(i)})
+	}
+	started := time.Now()
+	closed := make(chan struct{})
+	go func() {
+		audit.Close()
+		close(closed)
+	}()
+	require.Eventually(t, audit.abandon.Load, 2*auditCloseBudget, 10*time.Millisecond)
+	require.Less(t, time.Since(started), auditCloseBudget+time.Second)
+	audit.access.Unlock()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for the rest of the queue")
+	}
+	require.Less(t, len(readTrail(t, path)), auditQueueSize, "the backlog was written in full")
 }

@@ -54,6 +54,8 @@ type answeringOutbound struct {
 	adapter.Outbound
 	delay       time.Duration
 	measurement naive.ConnMeasurement
+	// gate, when set, holds every dial until it is closed. See hold.
+	gate chan struct{}
 
 	dials  atomic.Int32
 	access sync.Mutex
@@ -63,8 +65,28 @@ type answeringOutbound struct {
 
 func (o *answeringOutbound) Network() []string { return []string{N.NetworkTCP} }
 
-func (o *answeringOutbound) DialContext(_ context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
+// hold keeps every dial through this outbound waiting until release is called,
+// which is how a test reads what a detached refresh's trigger left behind
+// before the refresh itself can overwrite it. These outbounds answer at once,
+// so without it the refresh often lands first. The gate is opened on cleanup
+// too, so an assertion that fails first does not leave the refresh stuck.
+func (o *answeringOutbound) hold(t *testing.T) (release func()) {
+	gate := make(chan struct{})
+	o.gate = gate
+	release = sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return release
+}
+
+func (o *answeringOutbound) DialContext(ctx context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
 	o.dials.Add(1)
+	if o.gate != nil {
+		select {
+		case <-o.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	conn := &answeringConn{delay: o.delay, measurement: o.measurement}
 	o.access.Lock()
 	o.handed = append(o.handed, conn)
@@ -139,6 +161,9 @@ func newRaceFixture(t *testing.T, delay time.Duration, legs map[string][2]time.D
 		logger: logger.NOP(),
 		alpha:  testAlpha,
 		cache:  newSmartCache(context.Background(), "smart"),
+		// These outbounds answer at once; what is under test is what the
+		// answers say, not whether a loaded scheduler delivered them in time.
+		raceIgnoresDeadline: true,
 	}
 	// Sorted by tag so the configured order — which fallbacks read — is stable.
 	for _, tag := range []string{"a", "b", "c"} {
@@ -175,7 +200,7 @@ func TestARacePicksTheLowestScoreAndKeepsItsTunnel(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	winner, conn, err := fixture.smart.race(context.Background(), key, destination, nil)
+	winner, _, conn, err := fixture.smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	require.Equal(t, "b", winner)
 	require.NotNil(t, conn, "the winner's tunnel is handed back rather than redialed")
@@ -196,7 +221,7 @@ func TestARaceStoresWhatEveryGroupMeasured(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := fixture.smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := fixture.smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	conn.Close()
 
@@ -259,6 +284,32 @@ func TestOneRoundOfProbesPerDestination(t *testing.T) {
 	require.Equal(t, "b", entry.selected())
 }
 
+func TestAConnectionThatMissedARoundDoesNotStartAnother(t *testing.T) {
+	t.Parallel()
+	// The connection looked at the cache before the round wrote and claimed
+	// after it let go, so it found no round to wait on and led one of its own:
+	// every exit probed the destination twice. Seen under load.
+	fixture := newRaceFixture(t, 0, map[string][2]time.Duration{
+		"a": {ms(29), ms(120)},
+		"b": {ms(80), ms(5)},
+		"c": {ms(64), ms(60)},
+	})
+	destination := M.ParseSocksaddr("example.com:443")
+	key := destinationKey(destination)
+	_, _, conn, err := fixture.smart.race(context.Background(), key, destination, nil)
+	require.NoError(t, err)
+	conn.Close()
+	// Every probe out, including one a loaded scheduler started after the
+	// round had already decided.
+	require.Eventually(t, func() bool { return fixture.totalDials() == len(fixture.outbounds) },
+		time.Second, time.Millisecond)
+
+	conn, err = fixture.smart.raceOrWait(context.Background(), key, destination, nil)
+	require.NoError(t, err)
+	conn.Close()
+	require.Equal(t, len(fixture.outbounds)+1, fixture.totalDials(), "one dial on what the round decided, not a second round")
+}
+
 func TestABackgroundRefreshDoesNotStartOverTheTopOfARound(t *testing.T) {
 	t.Parallel()
 	fixture := newRaceFixture(t, 40*time.Millisecond, map[string][2]time.Duration{
@@ -267,13 +318,18 @@ func TestABackgroundRefreshDoesNotStartOverTheTopOfARound(t *testing.T) {
 	})
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
+	// Held, so the round is certainly still running when the refresh arrives;
+	// on a loaded machine its 40ms could otherwise be over by then.
+	releaseA := fixture.outbounds["a"].hold(t)
+	releaseB := fixture.outbounds["b"].hold(t)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		conn, err := fixture.smart.raceOrWait(context.Background(), key, destination)
+		conn, err := fixture.smart.raceOrWait(context.Background(), key, destination, nil)
 		if err == nil {
+			_, _ = conn.Read(make([]byte, 1)) // the race runs behind the connection; a read waits it out
 			conn.Close()
 		}
 	}()
@@ -283,6 +339,8 @@ func TestABackgroundRefreshDoesNotStartOverTheTopOfARound(t *testing.T) {
 	}, time.Second, time.Millisecond)
 
 	fixture.smart.raceDetached(key, destination)
+	releaseA()
+	releaseB()
 	wg.Wait()
 	require.Equal(t, len(fixture.outbounds), fixture.totalDials(),
 		"a refresh arriving mid-round must join it rather than duplicate the probes")
@@ -299,7 +357,7 @@ func TestARaceWithNothingReachableLeavesNoSnapshot(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, _, err := fixture.smart.race(context.Background(), key, destination, nil)
+	_, _, _, err := fixture.smart.race(context.Background(), key, destination, nil)
 	require.Error(t, err)
 	require.Equal(t, 0, fixture.outbounds["a"].openConns(),
 		"a probe that could not be used must still be closed")
@@ -387,6 +445,8 @@ func TestAConfirmedAnomalyEntersTheWindow(t *testing.T) {
 		RacedAt:  time.Now(),
 	})
 
+	// Held until the window is read: the refresh the streak starts rewrites it.
+	release := fixture.outbounds["a"].hold(t)
 	for range anomalyStreak {
 		fixture.smart.observeScore(key, destination, group, group.members[0], answering(ms(29), ms(400)))
 	}
@@ -403,6 +463,7 @@ func TestAConfirmedAnomalyEntersTheWindow(t *testing.T) {
 	// fixture down, and what it writes carries the evidence forward: the round
 	// extends the window it inherited rather than starting clean, so a group
 	// that answers healthily once does not erase a confirmed degradation.
+	release()
 	require.Eventually(t, func() bool {
 		return fixture.outbounds["a"].settledConns() == 1
 	}, time.Second, time.Millisecond)
@@ -493,10 +554,11 @@ func productionRelayCase(t *testing.T, usMeasurement naive.ConnMeasurement) *Sma
 		RemoteDial: 168625 * time.Microsecond, HasSpan: true, HasRemote: true,
 	}}
 	return &Smart{
-		ctx:    context.Background(),
-		logger: logger.NOP(),
-		alpha:  0.7,
-		cache:  newSmartCache(context.Background(), "smart"),
+		ctx:                 context.Background(),
+		logger:              logger.NOP(),
+		alpha:               0.7,
+		cache:               newSmartCache(context.Background(), "smart"),
+		raceIgnoresDeadline: true,
 		groups: []*smartGroup{
 			{tag: "us", bonus: 25 * time.Millisecond, members: []*smartMember{us}},
 			{tag: "jp", bonus: 40 * time.Millisecond, members: []*smartMember{jp}},
@@ -516,7 +578,7 @@ func TestARelayThatUnderstatesItsSpanIsNotRanked(t *testing.T) {
 	})
 	destination := M.ParseSocksaddr("ash.lg.speedypage.com:443")
 
-	winner, conn, err := smart.race(context.Background(), destinationKey(destination), destination, nil)
+	winner, _, conn, err := smart.race(context.Background(), destinationKey(destination), destination, nil)
 	require.NoError(t, err)
 	conn.Close()
 	require.Equal(t, "jp", winner)
@@ -536,7 +598,7 @@ func TestAnHonestRelayWinsTheDestinationItIsNearest(t *testing.T) {
 	})
 	destination := M.ParseSocksaddr("ash.lg.speedypage.com:443")
 
-	winner, conn, err := smart.race(context.Background(), destinationKey(destination), destination, nil)
+	winner, _, conn, err := smart.race(context.Background(), destinationKey(destination), destination, nil)
 	require.NoError(t, err)
 	conn.Close()
 	require.Equal(t, "us", winner, "an Ashburn destination belongs on the Ashburn exit")
@@ -607,6 +669,7 @@ func TestRaceOverflowFallsBackInsteadOfJoiningTheStorm(t *testing.T) {
 	}
 	conn, err = fixture.smart.dialTCP(context.Background(), destination)
 	require.NoError(t, err)
+	_, _ = conn.Read(make([]byte, 1)) // the race runs behind the connection; a read waits it out
 	conn.Close()
 	require.NotNil(t, fixture.smart.cache.load(destinationKey(destination)),
 		"the deferred destination is decided by its next connection")
@@ -637,28 +700,186 @@ func TestADeferredRefreshKeepsTheSnapshot(t *testing.T) {
 	require.Equal(t, "a", entry.selected(), "the stale snapshot stays until a refresh gets a slot")
 }
 
+// unreachableOutbound is an exit that cannot reach anything it is asked for
+// and says so at once, counting the tunnels opened through it.
+type unreachableOutbound struct {
+	adapter.Outbound
+	dials atomic.Int32
+}
+
+func (o *unreachableOutbound) Network() []string { return []string{N.NetworkTCP} }
+
+func (o *unreachableOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	o.dials.Add(1)
+	return nil, E.Cause(naive.ErrDestinationUnreachable, "connection refused")
+}
+
+func unreachableSmart(tags ...string) (*Smart, func() int) {
+	smart := &Smart{
+		ctx:    context.Background(),
+		logger: logger.NOP(),
+		alpha:  testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+	}
+	var exits []*unreachableOutbound
+	for _, tag := range tags {
+		exit := &unreachableOutbound{}
+		exits = append(exits, exit)
+		member := newMember(tag+"-1", ms(30))
+		member.outbound = exit
+		smart.groups = append(smart.groups, &smartGroup{tag: tag, members: []*smartMember{member}})
+	}
+	return smart, func() (total int) {
+		for _, exit := range exits {
+			total += int(exit.dials.Load())
+		}
+		return total
+	}
+}
+
+func TestADestinationRefusedWithoutARaceIsStillCooledDown(t *testing.T) {
+	t.Parallel()
+	// With every race slot busy a new destination is dialed on the static
+	// ranking, and that path makes no snapshot — while a refusal's cooldown was
+	// only ever filed on one. A dead peer reached that way was asked of every
+	// group on every connection, a tunnel per group each time, for as long as
+	// the slots stayed full; and what keeps them full is mostly dead peers.
+	smart, dials := unreachableSmart("a", "b", "c")
+	for range raceConcurrency {
+		smart.raceBound() <- struct{}{}
+	}
+	destination := M.ParseSocksaddr("203.0.113.9:6881")
+
+	_, err := smart.dialTCP(context.Background(), destination)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	require.Equal(t, 3, dials(), "the first connection asks every group, as it must")
+
+	_, err = smart.dialTCP(context.Background(), destination)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable,
+		"the next one is answered with the same verdict")
+	require.Equal(t, 3, dials(), "from the cooldowns, without a tunnel")
+}
+
+func TestARoundEveryGroupRefusedKeepsTheCooldownsItFiled(t *testing.T) {
+	t.Parallel()
+	// A round on a destination with no snapshot files each refusal on an entry
+	// the refusal makes, and then records the failed attempt. Recorded on a
+	// fresh entry, the attempt replaced the one holding the cooldowns, and the
+	// next connection asked again the group the round had just heard refuse.
+	// One group, so the round files exactly one cooldown and the count is exact.
+	smart, dials := unreachableSmart("a")
+	destination := M.ParseSocksaddr("203.0.113.9:6881")
+
+	// The round runs behind the connection, so its verdict is the first read's.
+	conn, err := smart.dialTCP(context.Background(), destination)
+	require.NoError(t, err)
+	_, err = conn.Read(make([]byte, 1))
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	conn.Close()
+	require.Equal(t, 1, dials())
+
+	_, err = smart.dialTCP(context.Background(), destination)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	require.Equal(t, 1, dials(), "the round's own refusal still holds")
+}
+
+func TestAFirstRoundSomeoneAnsweredKeepsTheCooldownsItFiled(t *testing.T) {
+	t.Parallel()
+	// The same round with a group answering writes a snapshot instead, and it
+	// replaced the entry holding the cooldowns with the nil the round started
+	// from. The next failover dialed a again to hear the same 502.
+	refusing := newMember("a-1", ms(30))
+	refusing.outbound = &unreachableOutbound{}
+	// b scores 0.7×30 + 100 = 121ms, so a — bounded at 21ms — is waited for
+	// rather than pruned, and its refusal is in before the snapshot is written.
+	fixture := newRaceFixture(t, 0, map[string][2]time.Duration{"b": {ms(30), ms(100)}})
+	smart := fixture.smart
+	smart.groups = append([]*smartGroup{{tag: "a", members: []*smartMember{refusing}}}, smart.groups...)
+	destination := M.ParseSocksaddr("example.com:25")
+	key := destinationKey(destination)
+
+	winner, _, conn, err := smart.race(context.Background(), key, destination, nil)
+	require.NoError(t, err)
+	conn.Close()
+	require.Equal(t, "b", winner)
+	require.True(t, smart.cache.load(key).blocked("a", 25, refusing, time.Now()))
+}
+
+func TestAFirstRoundKeepsTheCooldownsItFiledThroughItsProvisionalSnapshot(t *testing.T) {
+	t.Parallel()
+	// The same, on the snapshot a race writes before its stragglers are in.
+	gate := make(chan struct{})
+	t.Cleanup(sync.OnceFunc(func() { close(gate) }))
+	refusing := newMember("a-1", ms(30))
+	refusing.outbound = &unreachableOutbound{}
+	fast := newMember("b-1", ms(30))
+	fast.outbound = &answeringOutbound{measurement: answering(ms(30), ms(100))}
+	straggler := newMember("c-1", ms(20))
+	straggler.outbound = &gatedAnsweringOutbound{gate: gate, measurement: answering(ms(20), ms(1))}
+	smart := &Smart{
+		ctx:    context.Background(),
+		logger: logger.NOP(),
+		alpha:  testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "a", members: []*smartMember{refusing}},
+			{tag: "b", members: []*smartMember{fast}},
+			{tag: "c", members: []*smartMember{straggler}},
+		},
+	}
+	destination := M.ParseSocksaddr("example.com:25")
+	key := destinationKey(destination)
+	run, _ := smart.claimRace(key)
+
+	winner, _, conn, err := smart.race(context.Background(), key, destination, run)
+	require.NoError(t, err)
+	conn.Close()
+	require.Equal(t, "b", winner)
+	require.True(t, smart.cache.load(key).blocked("a", 25, refusing, time.Now()), "the provisional snapshot keeps it")
+	<-run.done
+	require.True(t, smart.cache.load(key).blocked("a", 25, refusing, time.Now()), "and so does the one written after the grace")
+}
+
 // gatedAnsweringOutbound answers only once the test opens its gate, which is
 // how a test creates a straggler deterministically instead of by timing.
 type gatedAnsweringOutbound struct {
 	adapter.Outbound
 	gate        chan struct{}
 	measurement naive.ConnMeasurement
-	dials       atomic.Int32
+	// deaf makes Measure wait for the gate even after the round is cancelled,
+	// so a test decides when the outcome reaches the channel.
+	deaf   bool
+	dials  atomic.Int32
+	handed atomic.Pointer[gatedAnsweringConn]
 }
 
 func (o *gatedAnsweringOutbound) Network() []string { return []string{N.NetworkTCP} }
 
 func (o *gatedAnsweringOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
 	o.dials.Add(1)
-	return &gatedAnsweringConn{answeringConn: answeringConn{measurement: o.measurement}, gate: o.gate}, nil
+	conn := &gatedAnsweringConn{answeringConn: answeringConn{measurement: o.measurement}, gate: o.gate, deaf: o.deaf}
+	o.handed.Store(conn)
+	return conn, nil
+}
+
+// closedConn reports whether the last tunnel this outbound handed out has
+// been closed.
+func (o *gatedAnsweringOutbound) closedConn() bool {
+	conn := o.handed.Load()
+	return conn != nil && conn.closed.Load() > 0
 }
 
 type gatedAnsweringConn struct {
 	answeringConn
 	gate chan struct{}
+	deaf bool
 }
 
 func (c *gatedAnsweringConn) Measure(ctx context.Context) (naive.ConnMeasurement, error) {
+	if c.deaf {
+		<-c.gate
+		return c.answeringConn.measurement, nil
+	}
 	select {
 	case <-c.gate:
 		return c.answeringConn.measurement, nil
@@ -670,9 +891,9 @@ func (c *gatedAnsweringConn) Measure(ctx context.Context) (naive.ConnMeasurement
 func TestAStragglerAnsweringInTheGraceRewritesTheVerdict(t *testing.T) {
 	t.Parallel()
 	// The deadline models an answer as arriving at local + remote; a real answer
-	// arrives at local + span, DNS included, so the strongest challenger — the
-	// one with the longest deadline — is exactly the one a tight deadline cuts
-	// off mid-flight. The caller cannot be kept waiting for it. The verdict can:
+	// can run over it — this connection's interior beyond the banked estimate, a
+	// lookup cold when races run — so the strongest challenger, the one with the
+	// longest deadline, is exactly the one a tight deadline cuts off mid-flight. The caller cannot be kept waiting for it. The verdict can:
 	// the snapshot is written after a grace, and the straggler's answer takes it.
 	gate := make(chan struct{})
 	slow := &gatedAnsweringOutbound{gate: gate, measurement: answering(ms(20), ms(1))}
@@ -690,13 +911,16 @@ func TestAStragglerAnsweringInTheGraceRewritesTheVerdict(t *testing.T) {
 			{tag: "a", bonus: ms(40), members: []*smartMember{slowMember}},
 			{tag: "b", members: []*smartMember{fastMember}},
 		},
+		// The gate opens after race returns, and on a loaded machine the
+		// answer can take longer than the real grace to come back.
+		raceGrace: raceDialTimeout,
 	}
 	destination := M.ParseSocksaddr("courier.example.com:443")
 	key := destinationKey(destination)
 
 	// The gate is still shut when race returns: the caller was not made to wait
 	// for the straggler, and it left with the best answer there was.
-	winner, conn, err := smart.race(context.Background(), key, destination, nil)
+	winner, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	conn.Close()
 	require.Equal(t, "b", winner)
@@ -716,6 +940,70 @@ func TestAStragglerAnsweringInTheGraceRewritesTheVerdict(t *testing.T) {
 		return measured && entry.selected() == "a"
 	}, 2*time.Second, 5*time.Millisecond,
 		"the straggler's answer must reach the snapshot and take the verdict")
+	require.True(t, slow.closedConn(), "the straggler's tunnel is surplus and must be closed")
+}
+
+func TestAStragglerThatMissesTheGraceIsStillClosed(t *testing.T) {
+	t.Parallel()
+	gate := make(chan struct{})
+	t.Cleanup(sync.OnceFunc(func() { close(gate) }))
+	slow := &gatedAnsweringOutbound{gate: gate, measurement: answering(ms(20), ms(1))}
+	slowMember := newMember("a-1", ms(20))
+	slowMember.outbound = slow
+	fastMember := newMember("b-1", ms(10))
+	fastMember.outbound = &answeringOutbound{measurement: answering(ms(10), ms(100))}
+	smart := &Smart{
+		ctx:    context.Background(),
+		logger: logger.NOP(),
+		alpha:  testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "a", bonus: ms(40), members: []*smartMember{slowMember}},
+			{tag: "b", members: []*smartMember{fastMember}},
+		},
+	}
+	destination := M.ParseSocksaddr("missed.example.com:443")
+	key := destinationKey(destination)
+	run, _ := smart.claimRace(key)
+
+	winner, _, conn, err := smart.race(context.Background(), key, destination, run)
+	require.NoError(t, err)
+	conn.Close()
+	require.Equal(t, "b", winner)
+	// The round is over once the grace has run out. The cancel that follows
+	// makes a's probe give up with its tunnel open, and nobody but the drainer
+	// is left to read it.
+	<-run.done
+	require.Eventually(t, slow.closedConn, time.Second, time.Millisecond,
+		"a probe still out when the grace ends must not leave its tunnel open")
+}
+
+func TestARoundStoppedBeforeAnyAnswerClosesTheLateTunnels(t *testing.T) {
+	t.Parallel()
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	slow := &gatedAnsweringOutbound{gate: gate, measurement: answering(ms(20), ms(1)), deaf: true}
+	member := newMember("a-1", ms(20))
+	member.outbound = slow
+	// The outbound is shutting down: the round stops with nothing in hand,
+	// and the probe answers only after race has returned.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	smart := &Smart{
+		ctx:    ctx,
+		logger: logger.NOP(),
+		alpha:  testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{{tag: "a", members: []*smartMember{member}}},
+	}
+	destination := M.ParseSocksaddr("stopped.example.com:443")
+
+	_, _, _, err := smart.race(context.Background(), destinationKey(destination), destination, nil)
+	require.Error(t, err)
+	release()
+	require.Eventually(t, slow.closedConn, time.Second, time.Millisecond,
+		"a probe that answers after the round stopped must not leave its tunnel open")
 }
 
 // failingOutbound answers with an error on the leg to the proxy — a pooled
@@ -764,6 +1052,7 @@ func TestOneSilentRoundKeepsTheIncumbentEvenWhenAStragglerRewritesIt(t *testing.
 			{tag: "b", members: []*smartMember{fastMember}},
 			{tag: "c", bonus: ms(60), members: []*smartMember{stragglerMember}},
 		},
+		raceGrace: raceDialTimeout, // see TestAStragglerAnsweringInTheGraceRewritesTheVerdict
 	}
 	destination := M.ParseSocksaddr("carried.example.com:443")
 	key := destinationKey(destination)
@@ -774,7 +1063,7 @@ func TestOneSilentRoundKeepsTheIncumbentEvenWhenAStragglerRewritesIt(t *testing.
 		RacedAt:  time.Now(),
 	})
 
-	winner, conn, err := smart.race(context.Background(), key, destination, nil)
+	winner, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	conn.Close()
 	require.Equal(t, "b", winner, "only b answered before the deadline")
@@ -828,7 +1117,7 @@ func TestACallerLeavingBeforeAnyAnswerDoesNotDiscardTheRound(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := smart.race(ctx, key, destination, nil)
+	_, _, _, err := smart.race(ctx, key, destination, nil)
 	require.Error(t, err, "the caller that hung up gets nothing")
 
 	// The probe answers afterwards, and its measurement is still banked.
@@ -868,7 +1157,7 @@ func TestAnAbandonedRoundHoldsItsSlotUntilTheProbesAreDone(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := smart.raceOrWait(ctx, key, destination)
+	_, err := smart.raceOrWait(ctx, key, destination, nil)
 	require.Error(t, err)
 
 	// The caller is gone but the probe is still out, so the slot is still taken.
@@ -879,4 +1168,118 @@ func TestAnAbandonedRoundHoldsItsSlotUntilTheProbesAreDone(t *testing.T) {
 		return len(smart.raceSlots) == 0
 	}, 2*time.Second, 5*time.Millisecond,
 		"and it comes back once the round has finished collecting")
+}
+
+func TestJitterNextToANearProxyIsNotAMove(t *testing.T) {
+	t.Parallel()
+	// A 5ms proxy and a 1ms CDN score about 4.5ms, so 5ms of jitter on the
+	// near hop doubles the score. The multiple alone read that as the
+	// destination moving, retired its best reading and re-raced it.
+	fixture := newRaceFixture(t, 0, map[string][2]time.Duration{"a": {ms(5), ms(1)}})
+	destination := M.ParseSocksaddr("cdn.example.com:443")
+	key := destinationKey(destination)
+	group := fixture.smart.groups[0]
+	fixture.smart.cache.store(key, &destinationEntry{
+		Remote:   map[string]remoteWindow{"a": {ms(1), ms(1), ms(1)}},
+		Path:     map[string]time.Duration{"a": ms(5)},
+		Selected: "a",
+		RacedAt:  time.Now(),
+	})
+
+	for range anomalyStreak {
+		fixture.smart.observeScore(key, destination, group, group.members[0],
+			answering(ms(12), ms(1)+300*time.Microsecond))
+	}
+	require.Equal(t, remoteWindow{ms(1), ms(1), ms(1)}, fixture.smart.cache.load(key).windowFor("a"))
+	require.Zero(t, fixture.outbounds["a"].dials.Load())
+}
+
+func TestARoundThatFoundNothingSaysWhose(t *testing.T) {
+	t.Parallel()
+	// A relay answers 502 for "every group refused", and the hop downstream
+	// cools the destination down. When the round failed on its own legs, that
+	// was the wrong verdict: an outage here left every new destination cooling
+	// down downstream, and still cooling after it ended.
+	smartWith := func(outbound func() adapter.Outbound) *Smart {
+		s := &Smart{ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+			cache: newSmartCache(context.Background(), "smart")}
+		for _, tag := range []string{"a", "b"} {
+			member := newMember(tag+"-1", ms(30))
+			member.outbound = outbound()
+			s.groups = append(s.groups, &smartGroup{tag: tag, members: []*smartMember{member}})
+		}
+		return s
+	}
+	destination := M.ParseSocksaddr("fresh.example:443")
+	key := destinationKey(destination)
+
+	broken := smartWith(func() adapter.Outbound { return &countingOutbound{} })
+	_, _, _, err := broken.race(context.Background(), key, destination, nil)
+	require.ErrorIs(t, err, naive.ErrNextHopUnreachable)
+	require.NotErrorIs(t, err, naive.ErrDestinationUnreachable)
+
+	refused := smartWith(func() adapter.Outbound {
+		return &egressOutbound{reach: func(M.Socksaddr) bool { return false }, dialed: make(chan M.Socksaddr, 8)}
+	})
+	_, _, _, err = refused.race(context.Background(), key, destination, nil)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+}
+
+// racedTunnel is a won race's tunnel with a download to read, a proxy's
+// ack to report and a request side to close.
+type racedTunnel struct {
+	answeringConn
+	closedWrite atomic.Int32
+}
+
+func (c *racedTunnel) Read(p []byte) (int, error) { return copy(p, "payload"), nil }
+func (c *racedTunnel) CloseWrite() error          { c.closedWrite.Add(1); return nil }
+func (c *racedTunnel) RemoteAck(context.Context) (naive.ConnectAck, bool, error) {
+	return naive.ConnectAck{Total: ms(7)}, true, nil
+}
+
+type racedTunnelOutbound struct {
+	adapter.Outbound
+	conn *racedTunnel
+}
+
+func (o *racedTunnelOutbound) Network() []string { return []string{N.NetworkTCP} }
+
+func (o *racedTunnelOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return o.conn, nil
+}
+
+func TestARacedConnectionIsItsMembersAsAnyOther(t *testing.T) {
+	t.Parallel()
+	// The winner's tunnel went to the caller as it was, so a raced download
+	// stamped nothing: the member carrying it looked idle to Smart.congested,
+	// and a probe left unanswered behind that download condemned it.
+	tunnel := &racedTunnel{answeringConn: answeringConn{measurement: answering(ms(30), ms(5))}}
+	member := newMember("a-1", ms(30))
+	member.outbound = &racedTunnelOutbound{conn: tunnel}
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache:               newSmartCache(context.Background(), "smart"),
+		groups:              []*smartGroup{{tag: "a", members: []*smartMember{member}}},
+		raceIgnoresDeadline: true,
+	}
+	destination := M.ParseSocksaddr("example.com:443")
+
+	conn, err := s.raceOrWait(context.Background(), destinationKey(destination), destination, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.Zero(t, member.deliveredAt.Load())
+	_, err = conn.Read(make([]byte, 16))
+	require.NoError(t, err)
+	require.EqualValues(t, 1, member.requestsTCP.total.Load(), "counted once the race has decided")
+	require.NotZero(t, member.deliveredAt.Load(), "a read stamps the member that raced")
+
+	reporter, isReporter := conn.(naive.RemoteDialReporter)
+	require.True(t, isReporter)
+	ack, hasAck, err := reporter.RemoteAck(context.Background())
+	require.NoError(t, err)
+	require.True(t, hasAck)
+	require.Equal(t, ms(7), ack.Total)
+	require.NoError(t, conn.(N.WriteCloser).CloseWrite())
+	require.EqualValues(t, 1, tunnel.closedWrite.Load())
 }

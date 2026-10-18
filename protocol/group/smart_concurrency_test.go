@@ -1,6 +1,7 @@
 package group
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,9 +41,9 @@ func TestDestinationEntryIsSafeUnderConcurrentUse(t *testing.T) {
 			now := time.Now()
 			switch i % 4 {
 			case 0:
-				entry.block(tag, now)
+				entry.block(tag, 443, now, nil)
 			case 1:
-				entry.blocked(tag, now)
+				entry.blocked(tag, 443, nil, now)
 			case 2:
 				entry.selected()
 			default:
@@ -262,6 +263,12 @@ type countingConn struct {
 	received      []byte
 	readDeadline  time.Time
 	writeDeadline time.Time
+	writesClosed  atomic.Int32
+}
+
+func (c *countingConn) CloseWrite() error {
+	c.writesClosed.Add(1)
+	return nil
 }
 
 func (c *countingConn) SetDeadline(t time.Time) error {
@@ -386,7 +393,7 @@ func failoverFixture(t *testing.T, dialGate chan struct{}, refuseAt chan struct{
 		key:         "example.com",
 		group:       groupA,
 		member:      condemned,
-		exclude:     map[string]bool{"a": true},
+		// No exclude: a first dial, as dialWithFailover hands it out.
 	}, replacement
 }
 
@@ -426,6 +433,161 @@ func TestWritesDuringAFailoverReachTheReplacement(t *testing.T) {
 	require.NoError(t, <-written)
 	require.Equal(t, "world", replacement.text(),
 		"a write that raced the failover must be replayed onto the new tunnel")
+}
+
+func TestCloseWriteWaitsForTheSettleAndLandsOnTheReplacement(t *testing.T) {
+	t.Parallel()
+	// Ending the request on the tunnel about to be condemned would leave the
+	// replacement's request open for good: the far side waits for the rest of
+	// a request whose sender is waiting for the answer.
+	refuseAt := make(chan struct{})
+	conn, replacement := failoverFixture(t, nil, refuseAt)
+	_, err := conn.Write([]byte("request"))
+	require.NoError(t, err)
+
+	closed := make(chan error, 1)
+	go func() { closed <- conn.CloseWrite() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("CloseWrite returned before the tunnel was settled: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(refuseAt)
+	require.NoError(t, <-closed)
+	require.Equal(t, "request", replacement.text())
+	require.EqualValues(t, 1, replacement.writesClosed.Load(),
+		"the half-close must land on the tunnel that carries the replay")
+}
+
+func TestOnlyAnOpeningKeptWholeIsReplayed(t *testing.T) {
+	t.Parallel()
+	// An overflow used to be forgotten by the next write that fit, so the
+	// opening was replayed with the overflowing write missing from its middle
+	// — and the caller had been told every byte was sent. A buffer that
+	// overflowed on the first write looked like nothing had been written.
+	for name, test := range map[string]struct {
+		writes []int
+		replay bool
+	}{
+		"fits":                     {writes: []int{40000, 20000}, replay: true},
+		"overflow then small":      {writes: []int{40000, 30000, 1000}},
+		"first write is too large": {writes: []int{replayBufferLimit + 1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			conn, replacement := failoverFixture(t, nil, nil)
+			var sent []byte
+			for i, size := range test.writes {
+				chunk := bytes.Repeat([]byte{byte('a' + i)}, size)
+				_, err := conn.Write(chunk)
+				require.NoError(t, err)
+				sent = append(sent, chunk...)
+			}
+			err := conn.settle()
+			if test.replay {
+				require.NoError(t, err)
+				require.Equal(t, string(sent), replacement.text())
+				return
+			}
+			require.Error(t, err, "an opening that was not kept whole must fail, not be replayed")
+			require.Empty(t, replacement.text())
+		})
+	}
+}
+
+// stalledLegConn is a replacement whose leg is still coming up: a write parks
+// on the establishment gate until the stream is ready or the tunnel closed,
+// which is what a cronet tunnel's write does.
+type stalledLegConn struct {
+	countingConn
+	entered chan struct{}
+	ready   chan struct{}
+	gone    chan struct{}
+	once    sync.Once
+}
+
+func (c *stalledLegConn) Write(p []byte) (int, error) {
+	select {
+	case c.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-c.ready:
+		return c.countingConn.Write(p)
+	case <-c.gone:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *stalledLegConn) Close() error {
+	c.once.Do(func() { close(c.gone) })
+	return c.countingConn.Close()
+}
+
+func stalledFailover(t *testing.T) (*replayConn, *stalledLegConn) {
+	t.Helper()
+	var closed atomic.Int32
+	replacement := &stalledLegConn{
+		countingConn: countingConn{closed: &closed},
+		entered:      make(chan struct{}, 1),
+		ready:        make(chan struct{}),
+		gone:         make(chan struct{}),
+	}
+	conn, _ := failoverFixture(t, nil, nil)
+	conn.smart.groups[1].members[0].outbound = &gatedOutbound{conn: replacement}
+	_, err := conn.Write([]byte("hello"))
+	require.NoError(t, err)
+	go func() { _, _ = conn.Read(make([]byte, 1)) }()
+	select {
+	case <-replacement.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the failover never reached the replacement")
+	}
+	return conn, replacement
+}
+
+func TestCloseIsNotHeldUpByAReplacementStillComingUp(t *testing.T) {
+	t.Parallel()
+	// The opening used to be flushed onto the replacement with the lock held.
+	// A leg still coming up held it as long as it took — minutes when it
+	// could not connect either — and Close, the deadlines and every write
+	// waited behind it, the connection kept open by the very call meant to
+	// end it.
+	conn, replacement := stalledFailover(t)
+
+	closed := make(chan struct{})
+	go func() {
+		_ = conn.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		close(replacement.ready)
+		t.Fatal("Close waited for the replacement's leg")
+	}
+	require.NotZero(t, replacement.closed.Load(), "and it closed the replacement, which is what was stuck")
+}
+
+func TestAWriteDuringTheFlushLandsAfterIt(t *testing.T) {
+	t.Parallel()
+	conn, replacement := stalledFailover(t)
+
+	written := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte(" world"))
+		written <- err
+	}()
+	require.Eventually(t, func() bool {
+		conn.access.Lock()
+		defer conn.access.Unlock()
+		return len(conn.replay) > 0
+	}, 2*time.Second, time.Millisecond, "the write joins the buffer behind the flush in progress")
+	close(replacement.ready)
+
+	require.NoError(t, <-written)
+	require.Equal(t, "hello world", replacement.text())
 }
 
 func TestClosingDuringAFailoverDoesNotLeakTheReplacement(t *testing.T) {
@@ -784,6 +946,38 @@ func TestATunnelThatCarriedNothingIsReplayed(t *testing.T) {
 		"the condemned tunnel is closed before the replacement is dialed")
 }
 
+func TestATunnelThatCarriedOnlyAClientHelloIsReplayed(t *testing.T) {
+	t.Parallel()
+	// A relay answering 503, or a stream breaking before the answer, after
+	// the opening went out: a ClientHello alone may arrive twice, so the
+	// connection moves to another group instead of failing the browser. One
+	// byte of anything else after it, and it may not.
+	hello := goClientHello(t)
+	for name, c := range map[string]struct {
+		opening  []byte
+		replayed bool
+	}{
+		"client hello":                {hello, true},
+		"client hello then a request": {append(append([]byte(nil), hello...), "GET / HTTP/1.1\r\n\r\n"...), false},
+		"http request":                {[]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"), false},
+	} {
+		tunnel := &brokenTunnelConn{writeSucceeds: true}
+		conn, replacement := brokenTunnelFixture(t, tunnel)
+		_, err := conn.Write(c.opening)
+		require.NoError(t, err, name)
+		require.True(t, tunnel.CarriedPayload(), name)
+
+		err = conn.settle()
+		if c.replayed {
+			require.NoError(t, err, name)
+			require.Equal(t, string(c.opening), replacement.text(), name)
+		} else {
+			require.ErrorIs(t, err, naive.ErrNextHopUnreachable, name)
+			require.Empty(t, replacement.text(), name)
+		}
+	}
+}
+
 // gatedTunnelConn models the real tunnel's write path faithfully: Write blocks
 // on an establishment gate, the carried record and Close share one mutex, and
 // a write that passes the gate re-checks closed under that mutex — so once
@@ -803,6 +997,12 @@ type gatedTunnelConn struct {
 
 	waiting     atomic.Int32
 	closedCount atomic.Int32
+
+	// openOnTestimony opens the gate the instant CarriedPayload has answered,
+	// and waits for the parked write to finish before returning — the worst
+	// moment for the gate to open, made certain instead of left to timing.
+	openOnTestimony bool
+	openOnce        sync.Once
 }
 
 func newGatedTunnelConn() *gatedTunnelConn {
@@ -847,8 +1047,15 @@ func (c *gatedTunnelConn) Close() error {
 
 func (c *gatedTunnelConn) CarriedPayload() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.carried
+	carried := c.carried
+	c.mu.Unlock()
+	if c.openOnTestimony {
+		c.openOnce.Do(func() { close(c.gate) })
+		for c.waiting.Load() > 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	return carried
 }
 
 func (c *gatedTunnelConn) WaitReady(context.Context) error  { return nil }
@@ -900,29 +1107,31 @@ func TestAWriteBlockedOnTheGateIsReleasedByTheSettleAndReplayedOnce(t *testing.T
 
 func TestAGateRacingTheSettleNeverDoublesTheWrite(t *testing.T) {
 	t.Parallel()
-	// Whichever side wins — the gate releasing the write onto the condemned
-	// tunnel, or the settle closing it first — the bytes must end up on at
-	// most one tunnel. Which one is timing; both is the double delivery this
-	// whole mechanism exists to rule out.
-	for range 50 {
-		tunnel := newGatedTunnelConn()
-		conn, replacement := brokenTunnelFixture(t, tunnel)
+	// The gate opens right after the settle has read the tunnel's testimony.
+	// If the settle had not closed the tunnel first, the parked write would
+	// land on it after the tunnel said it carried nothing, and the replay
+	// would deliver the same bytes a second time.
+	tunnel := newGatedTunnelConn()
+	tunnel.openOnTestimony = true
+	conn, replacement := brokenTunnelFixture(t, tunnel)
 
-		go func() { _, _ = conn.Read(make([]byte, 1)) }()
-		written := make(chan struct{})
-		go func() {
-			_, _ = conn.Write([]byte("x"))
-			close(written)
-		}()
-		go close(tunnel.gate)
-		close(tunnel.measureRefused)
-		<-written
+	go func() { _, _ = conn.Read(make([]byte, 1)) }()
+	written := make(chan struct{})
+	go func() {
+		_, _ = conn.Write([]byte("x"))
+		close(written)
+	}()
+	require.Eventually(t, func() bool { return tunnel.waiting.Load() == 1 },
+		time.Second, time.Millisecond)
+	close(tunnel.measureRefused)
+	<-written
+	// The write can return before the settle has flushed the replay buffer.
+	_ = conn.settle()
 
-		carried := tunnel.CarriedPayload()
-		flushed := replacement.text() != ""
-		require.False(t, carried && flushed,
-			"the write landed on the condemned tunnel and was still replayed")
-	}
+	carried := tunnel.CarriedPayload()
+	flushed := replacement.text() != ""
+	require.False(t, carried && flushed,
+		"the write landed on the condemned tunnel and was still replayed")
 }
 
 func TestReplayRequiresProofTheTunnelCarriedNothing(t *testing.T) {
@@ -952,4 +1161,226 @@ func TestReplayRequiresProofTheTunnelCarriedNothing(t *testing.T) {
 	// before writes can pass the gate — still counts as proof.
 	require.True(t, provenUndelivered(wrapped(errLegTimedOut), &refusingConn{}))
 	require.False(t, provenUndelivered(wrapped(io.ErrUnexpectedEOF), &refusingConn{}))
+}
+
+// refusedStreamConn is a tunnel whose stream the proxy refused unprocessed,
+// after the opening had already been written onto it.
+type refusedStreamConn struct{ refusingConn }
+
+func (c *refusedStreamConn) Measure(context.Context) (naive.ConnMeasurement, error) {
+	return naive.ConnMeasurement{}, fmt.Errorf("%w: %w: http2 server refused stream",
+		naive.ErrNextHopUnreachable, naive.ErrStreamRefused)
+}
+
+func (c *refusedStreamConn) CarriedPayload() bool { return true }
+
+func TestAStreamRefusedUnprocessedIsReplayedAndCondemnsNobody(t *testing.T) {
+	t.Parallel()
+	// The opening went onto the stream, so the tunnel says it carried
+	// payload — but REFUSED_STREAM proves none of it was processed. Treated
+	// as delivered, the connection failed when it could have moved; and a
+	// heartbeat landing on it took a healthy member out of service.
+	conn, replacement := failoverFixture(t, nil, nil)
+	conn.Conn = &refusedStreamConn{}
+	// The failure is not one that condemns, so the member is confirmed with a
+	// probe in the background; give it a proxy that answers.
+	conn.member.outbound = &answeringOutbound{measurement: answering(ms(30), 0)}
+	_, err := conn.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, conn.settle())
+	require.Equal(t, "hello", replacement.text())
+
+	member := newMember("m", ms(30))
+	conn.smart.markDown(member, fmt.Errorf("%w: %w", naive.ErrNextHopUnreachable, naive.ErrStreamRefused))
+	require.True(t, member.healthy.Load())
+}
+
+// lateFailureConn's stream fails just as the readiness bound expires, the
+// failure arriving with the deadline rather than because of it.
+type lateFailureConn struct {
+	refusingConn
+	failure error
+}
+
+func (c *lateFailureConn) WaitReady(ctx context.Context) error {
+	<-ctx.Done()
+	if c.failure != nil {
+		return c.failure
+	}
+	return ctx.Err()
+}
+
+func TestAFailureArrivingWithTheReadinessBoundKeepsItsName(t *testing.T) {
+	t.Parallel()
+	// The bound expiring renamed whatever the wait returned to a blackholed
+	// leg, which condemns the member on sight — a refused stream included.
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), cache: newSmartCache(context.Background(), "smart")}
+	member := newMember("m", ms(20))
+	member.record(naive.ConnMeasurement{Setup: ms(10), RoundTrip: ms(20), ServerSpan: ms(10), HasSpan: true})
+	_, derived := member.readyTimeout()
+	require.True(t, derived)
+
+	err := smart.awaitReady(context.Background(), member,
+		&lateFailureConn{failure: fmt.Errorf("%w: http2 server refused stream", naive.ErrStreamRefused)})
+	require.ErrorIs(t, err, naive.ErrStreamRefused)
+	require.NotErrorIs(t, err, errLegTimedOut)
+
+	err = smart.awaitReady(context.Background(), member, &lateFailureConn{})
+	require.ErrorIs(t, err, errLegTimedOut, "a wait that simply ran out is still the bound's")
+}
+
+func TestABlackholedLegOnAMemberStillDeliveringIsNotCondemnedOnSight(t *testing.T) {
+	t.Parallel()
+	// A path saturated by a bulk transfer misses the establishment bound the
+	// way a blackhole does. Condemned on sight, the transfer moved to the next
+	// group and saturated that one; delivering, it is left to the probe.
+	out := &silentOutbound{queue: 10 * time.Second}
+	member := newMember("out-hk-hkt", ms(30))
+	member.outbound = out
+	member.noteDelivered()
+	group := &smartGroup{tag: "hk", members: []*smartMember{member}}
+	group.selected.Store(member)
+	smart := &Smart{
+		ctx: context.Background(), logger: logger.NOP(),
+		cache: newSmartCache(context.Background(), "smart"), groups: []*smartGroup{group},
+	}
+	blackholed := fmt.Errorf("%w: %w", naive.ErrNextHopUnreachable, errLegTimedOut)
+
+	smart.reportFailure("3f2a", M.ParseSocksaddr("apple.com:443"), group, member, blackholed)
+	require.True(t, member.healthy.Load(), "not on sight")
+	require.Eventually(t, func() bool { return out.dials.Load() == 2 && !member.probing.Load() },
+		time.Second, time.Millisecond, "the probe still runs")
+	require.True(t, member.healthy.Load(), "and its silence is excused the same way")
+
+	member.deliveredAt.Store(time.Now().Add(-congestionGrace - time.Second).UnixNano())
+	smart.reportFailure("3f2a", M.ParseSocksaddr("apple.com:443"), group, member, blackholed)
+	require.False(t, member.healthy.Load(), "once nothing is arriving, a blackhole is condemned on sight again")
+}
+
+// deliveringConn is a tunnel the proxy answered that has payload waiting.
+type deliveringConn struct{ answeringConn }
+
+func (c *deliveringConn) Read(p []byte) (int, error) { return copy(p, "x"), nil }
+
+func TestAReadIsCreditedToTheMemberThatCarriedIt(t *testing.T) {
+	t.Parallel()
+	// After a failover the payload comes from the replacement; crediting the
+	// member the connection left would keep a dead node looking alive.
+	condemned := newMember("a-1", ms(30))
+	condemned.outbound = &gatedOutbound{}
+	spare := newMember("b-1", ms(40))
+	spare.outbound = &gatedOutbound{conn: &deliveringConn{answeringConn{measurement: answering(ms(40), ms(1))}}}
+	groupA := &smartGroup{tag: "a", members: []*smartMember{condemned}}
+	groupB := &smartGroup{tag: "b", members: []*smartMember{spare}}
+	smart := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{groupA, groupB},
+	}
+	conn := &replayConn{
+		Conn: &refusingConn{}, smart: smart, destination: M.ParseSocksaddr("example.com:443"),
+		key: "example.com", group: groupA, member: condemned, exclude: map[string]bool{"a": true},
+	}
+
+	n, err := conn.Read(make([]byte, 1))
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.NotZero(t, spare.deliveredAt.Load())
+	require.Zero(t, condemned.deliveredAt.Load())
+}
+
+func TestASettleLeftUnansweredSuspectsItsMemberWithoutGivingUp(t *testing.T) {
+	t.Parallel()
+	// A proxy that silently stops answering leaves each new connection
+	// waiting out the settle timeout, and nothing checked the member until the
+	// heartbeat. The wait itself is untouched: a slow destination is still a
+	// working one, so only the probe beside it decides anything.
+	gate := make(chan struct{})
+	out := &silentOutbound{}
+	member := newMember("out-hk", ms(30))
+	member.outbound = out
+	group := &smartGroup{tag: "hk", members: []*smartMember{member}}
+	group.selected.Store(member)
+	smart := &Smart{
+		ctx: context.Background(), logger: logger.NOP(),
+		cache: newSmartCache(context.Background(), "smart"), groups: []*smartGroup{group},
+		suspectAfter: 20 * time.Millisecond,
+	}
+	conn := &replayConn{
+		Conn:  &gatedAnsweringConn{answeringConn: answeringConn{measurement: answering(ms(30), ms(1))}, gate: gate},
+		smart: smart, destination: M.ParseSocksaddr("example.com:443"), key: "example.com",
+		group: group, member: member, exclude: map[string]bool{"hk": true},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		done <- err
+	}()
+
+	require.Eventually(t, func() bool { return !member.healthy.Load() }, 5*time.Second, time.Millisecond,
+		"answering nothing and delivering nothing, the probe condemns it")
+	require.EqualValues(t, 2, out.dials.Load())
+	select {
+	case err := <-done:
+		t.Fatal("the connection's own wait was cut short: ", err)
+	default:
+	}
+	close(gate)
+	require.ErrorIs(t, <-done, io.EOF, "the settle completes when the answer comes")
+}
+
+func TestSuspicionSpendsOneProbePerMemberPerWindow(t *testing.T) {
+	t.Parallel()
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	out := &crowdingOutbound{}
+	member := newMember("out-hk", ms(30))
+	member.outbound = out
+	group := &smartGroup{tag: "hk", members: []*smartMember{member}}
+	group.selected.Store(member)
+	smart := &Smart{
+		ctx: context.Background(), logger: logger.NOP(),
+		cache: newSmartCache(context.Background(), "smart"), groups: []*smartGroup{group},
+		suspectAfter: 5 * time.Millisecond,
+	}
+	for range 4 {
+		conn := &replayConn{
+			Conn:  &gatedAnsweringConn{answeringConn: answeringConn{measurement: answering(ms(30), ms(1))}, gate: gate},
+			smart: smart, destination: M.ParseSocksaddr("example.com:443"), key: "example.com",
+			group: group, member: member, exclude: map[string]bool{"hk": true},
+		}
+		go func() { _, _ = conn.Read(make([]byte, 1)) }()
+		// One at a time, so each suspicion finds the last probe finished and
+		// only the window can be what stops it.
+		require.Eventually(t, func() bool { return out.dials.Load() == 1 && !member.probing.Load() },
+			time.Second, time.Millisecond)
+		time.Sleep(4 * smart.suspectAfter)
+	}
+	require.EqualValues(t, 1, out.dials.Load())
+	require.True(t, member.healthy.Load())
+}
+
+func TestASettleAnsweredInTimeSuspectsNothing(t *testing.T) {
+	t.Parallel()
+	out := &crowdingOutbound{}
+	member := newMember("out-hk", ms(30))
+	member.outbound = out
+	group := &smartGroup{tag: "hk", members: []*smartMember{member}}
+	smart := &Smart{
+		ctx: context.Background(), logger: logger.NOP(),
+		cache: newSmartCache(context.Background(), "smart"), groups: []*smartGroup{group},
+		// The settle has to beat it, and under -race with every test in
+		// parallel one took more than 5ms.
+		suspectAfter: 200 * time.Millisecond,
+	}
+	conn := &replayConn{
+		Conn:  &answeringConn{measurement: answering(ms(30), ms(1))},
+		smart: smart, destination: M.ParseSocksaddr("example.com:443"), key: "example.com",
+		group: group, member: member, exclude: map[string]bool{"hk": true},
+	}
+	_, err := conn.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	// Past where a timer left running would have fired.
+	time.Sleep(300 * time.Millisecond)
+	require.Zero(t, out.dials.Load())
 }

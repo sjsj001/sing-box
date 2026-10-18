@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -109,6 +110,14 @@ func smartNodes(path string) error {
 		return err
 	}
 	defer file.Close()
+	// The previous generation first. A rotation can land in the middle of a
+	// dump, and reading only the current file then takes its second half for
+	// where things stand.
+	var trail io.Reader = file
+	if previous, openErr := os.Open(path + ".1"); openErr == nil {
+		defer previous.Close()
+		trail = io.MultiReader(previous, file)
+	}
 
 	usage := make(map[string]*nodeUsage)
 	node := func(group string, member string) *nodeUsage {
@@ -143,7 +152,7 @@ func smartNodes(path string) error {
 	// "this file cannot say".
 	counted := false
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(trail)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	for scanner.Scan() {
 		var record auditLine
@@ -288,9 +297,6 @@ func smartNodes(path string) error {
 		return nil
 	}
 	for _, entry := range nodes {
-		if len(entry.destinations) == 0 {
-			continue
-		}
 		// Busiest first, then the ones that can be read at all, so --top spends
 		// its budget on the lines worth having.
 		sort.Slice(entry.destinations, func(i, j int) bool {
@@ -323,11 +329,15 @@ func smartNodes(path string) error {
 			fmt.Printf("  ... %d more\n", len(entry.destinations)-len(shown))
 		}
 		if rest := entry.requests() - listed; counted && rest > 0 {
-			// The node carried these, but the destination that took them is not
-			// in the table any more — dropped since the dump, or never given an
-			// entry to count against. Saying so beats a list that quietly does
-			// not add up to the row above it.
-			fmt.Printf("  %9d  (on destinations no longer held)\n", rest)
+			// A destination's count is what it carried on every node, listed
+			// under the node holding it now, while the row counts only what
+			// this node carried. The list comes out short when this node
+			// carried destinations that have since moved to another node or
+			// left the table, and long when destinations that moved here bring
+			// what they carried elsewhere; both can happen at once. A shortfall
+			// gets a line of its own rather than a list that quietly does not
+			// add up to the row above it.
+			fmt.Printf("  %9d  (on destinations now held by another node, or no longer held)\n", rest)
 		}
 	}
 	return nil

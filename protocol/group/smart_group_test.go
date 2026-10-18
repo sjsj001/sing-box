@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,6 +90,39 @@ func TestGroupFastestYieldsBeyondHysteresis(t *testing.T) {
 	require.Equal(t, "challenger", group.current().tag)
 }
 
+func TestGroupFastestKeepsItsMemberThroughANetworkChange(t *testing.T) {
+	t.Parallel()
+	// After the change nothing is measured. Falling back to the first member
+	// moved the group to the slower one, and once both were measured again
+	// the hysteresis held it there: 40ms against 50ms is inside it.
+	slow := newMember("slow", ms(50))
+	fast := newMember("fast", ms(40))
+	group := &smartGroup{tag: "g", selectFastest: true, members: []*smartMember{slow, fast}}
+	require.Equal(t, "fast", group.current().tag)
+
+	slow.resetPath()
+	fast.resetPath()
+	require.Equal(t, "fast", group.current().tag, "nothing measured yet is not a reason to move")
+	slow.record(measured(ms(50)))
+	require.Equal(t, "fast", group.current().tag, "nor is the other member being measured first")
+	fast.record(measured(ms(40)))
+	require.Equal(t, "fast", group.current().tag)
+}
+
+func TestGroupFastestDoesNotHoldAMemberPickedBlind(t *testing.T) {
+	t.Parallel()
+	// The first member stood in while nothing was measured. It never earned
+	// the place, so it holds nothing once the others have numbers — and a
+	// member that is never measured at all would otherwise keep it for good.
+	unmeasured := newMember("unmeasured", 0)
+	measuredLater := newMember("measured", 0)
+	group := &smartGroup{tag: "g", selectFastest: true, members: []*smartMember{unmeasured, measuredLater}}
+	require.Equal(t, "unmeasured", group.current().tag)
+
+	measuredLater.record(measured(ms(200)))
+	require.Equal(t, "measured", group.current().tag)
+}
+
 func TestGroupFastestDropsAnUnhealthyIncumbentAtOnce(t *testing.T) {
 	t.Parallel()
 	// Hysteresis is about noise, not about failure: a member that is gone must
@@ -150,7 +184,7 @@ func TestSilentProxyDoesNotBecomeALocalMeasurement(t *testing.T) {
 	// file the distance to the destination against the node, so the node would
 	// be ranked by whichever destinations it happened to be asked for.
 	member := &smartMember{tag: "silent"}
-	member.record(naive.ConnMeasurement{RoundTrip: ms(400)})
+	(&Smart{ctx: context.Background(), logger: logger.NOP()}).record(member, naive.ConnMeasurement{RoundTrip: ms(400)})
 	_, hasLocal := member.local()
 	require.False(t, hasLocal, "an unsplittable round trip must not become a local reading")
 	require.True(t, member.healthy.Load(), "but reaching the proxy still proves it is alive")
@@ -191,7 +225,7 @@ func TestAbandonedProbeDoesNotCondemnItsMember(t *testing.T) {
 	// members, and treating it as a fault takes healthy nodes out of service
 	// every time they merely come second — which then distorts the next race,
 	// because the members it excluded were never asked.
-	smart := &Smart{logger: logger.NOP(), cache: newSmartCache(context.Background(), "smart")}
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), cache: newSmartCache(context.Background(), "smart")}
 	group := &smartGroup{tag: "g"}
 	member := newMember("loser", ms(30))
 
@@ -221,7 +255,7 @@ func TestTheDerivedEstablishmentBoundStillCondemnsAMember(t *testing.T) {
 	// exactly the same way as a caller who lost interest. Only the sentinel
 	// separates them, and getting it wrong either condemns healthy members or
 	// leaves a blackholed leg in service.
-	smart := &Smart{logger: logger.NOP(), cache: newSmartCache(context.Background(), "smart")}
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), cache: newSmartCache(context.Background(), "smart")}
 	group := &smartGroup{tag: "g"}
 	member := newMember("blackholed", ms(30))
 
@@ -399,31 +433,6 @@ func TestTheEstablishmentBoundComesFromTheHandshakeNotTheFloorOfTheRoundTrip(t *
 	require.Equal(t, ms(120)*readyTimeoutFactor+readyTimeoutFloor, budget)
 }
 
-func TestWarmingCoversEveryPoolExactlyOnce(t *testing.T) {
-	t.Parallel()
-	// naive hands each stream to the next pool in rotation, so the number of
-	// dials that leaves none of them cold is the member's own concurrency:
-	// fewer leaves pools cold, more lands back on ones already warm.
-	member := &smartMember{tag: "m"}
-	require.Equal(t, 1, member.warmupDials(), "an outbound with no pools still needs one dial")
-
-	member.outbound = pooledOutbound{pools: 4}
-	require.Equal(t, 4, member.warmupDials())
-
-	member.outbound = pooledOutbound{pools: 1}
-	require.Equal(t, 1, member.warmupDials(), "the default must not open three useless connections")
-
-	member.outbound = pooledOutbound{pools: 64}
-	require.Equal(t, warmupDialsMax, member.warmupDials(), "and an extreme one is capped")
-}
-
-type pooledOutbound struct {
-	adapter.Outbound
-	pools int
-}
-
-func (o pooledOutbound) Pools() int { return o.pools }
-
 func TestHeartbeatsCarryNoPeriodToLockOnto(t *testing.T) {
 	t.Parallel()
 	// The contents are encrypted; the timing is not. A small exchange on an
@@ -508,7 +517,7 @@ func TestAnUnderstatedSpanTakesItsLocalLegDownWithIt(t *testing.T) {
 
 	// And nothing from it reaches the member's estimate of how far away it is.
 	member := &smartMember{tag: "relay"}
-	member.record(validated)
+	(&Smart{ctx: context.Background(), logger: logger.NOP()}).record(member, validated)
 	_, hasLocal := member.local()
 	require.False(t, hasLocal)
 	require.True(t, member.healthy.Load(), "but reaching the proxy still proves it is alive")
@@ -537,7 +546,7 @@ func TestGroupsAreStillOfferedBeforeAnythingIsMeasured(t *testing.T) {
 		groups: []*smartGroup{{tag: "cold", members: []*smartMember{cold}}},
 	}
 
-	candidates := smart.candidates(nil, time.Now())
+	candidates := smart.candidates(nil, 443, time.Now())
 	require.Len(t, candidates, 1, "a group with nothing measured must still be offered")
 	require.False(t, candidates[0].hasLocal)
 	require.Equal(t, "cold", fallbackGroup(testAlpha, candidates),
@@ -563,7 +572,7 @@ func TestASnapshotCarriesAGroupUntilItIsMeasuredAgain(t *testing.T) {
 		RacedAt: time.Now(),
 	}
 
-	candidates := smart.candidates(entry, time.Now())
+	candidates := smart.candidates(entry, 443, time.Now())
 	require.Len(t, candidates, 1)
 	require.True(t, candidates[0].hasLocal)
 	require.Equal(t, ms(29), candidates[0].local)
@@ -594,9 +603,49 @@ func TestUDPSkipsAGroupWhoseMemberCannotCarryIt(t *testing.T) {
 
 	entry := &destinationEntry{Remote: map[string]remoteWindow{"near": {ms(1)}, "far": {ms(1)}}}
 	now := time.Now()
-	require.Len(t, smart.candidates(entry, now), 2, "both groups can carry TCP")
+	require.Len(t, smart.candidates(entry, 443, now), 2, "both groups can carry TCP")
 
-	udp := smart.usableCandidates(entry, now, N.NetworkUDP)
+	udp := smart.usableCandidates(entry, 443, now, N.NetworkUDP)
+	require.Len(t, udp, 1)
+	require.Equal(t, "far", udp[0].tag)
+}
+
+func TestUDPIsCarriedWhenTheOnlyGroupThatCanCarryItIsLeftOut(t *testing.T) {
+	t.Parallel()
+	// Down or cooling groups are left out before UDP narrows the rest. With
+	// only one group able to carry UDP, that group being down, or refused on
+	// the port over TCP, used to fail every UDP flow outright.
+	tcpOnly := newMember("tcp-only", ms(29))
+	tcpOnly.outbound = fakeOutbound{networks: []string{N.NetworkTCP}}
+	capable := newMember("both", ms(80))
+	capable.outbound = fakeOutbound{networks: []string{N.NetworkTCP, N.NetworkUDP}}
+	smart := &Smart{
+		alpha: testAlpha,
+		groups: []*smartGroup{
+			{tag: "near", members: []*smartMember{tcpOnly}},
+			{tag: "far", members: []*smartMember{capable}},
+		},
+	}
+	now := time.Now()
+
+	capable.healthy.Store(false)
+	udp := smart.usableCandidates(nil, 443, now, N.NetworkUDP)
+	require.Len(t, udp, 1)
+	require.Equal(t, "far", udp[0].tag, "down")
+
+	capable.healthy.Store(true)
+	entry := &destinationEntry{}
+	entry.block("far", 443, now, nil)
+	udp = smart.usableCandidates(entry, 443, now, N.NetworkUDP)
+	require.Len(t, udp, 1)
+	require.Equal(t, "far", udp[0].tag, "refused over TCP on the port")
+
+	// And a group that is up comes before one that is down.
+	downToo := newMember("both-down", ms(10))
+	downToo.outbound = fakeOutbound{networks: []string{N.NetworkTCP, N.NetworkUDP}}
+	downToo.healthy.Store(false)
+	smart.groups = append(smart.groups, &smartGroup{tag: "nearer", members: []*smartMember{downToo}})
+	udp = smart.usableCandidates(entry, 443, now, N.NetworkUDP)
 	require.Len(t, udp, 1)
 	require.Equal(t, "far", udp[0].tag)
 }
@@ -663,7 +712,7 @@ func TestAHeartbeatDoesNotMakeAnIdleMemberLookBusy(t *testing.T) {
 
 	// The real heartbeat path, not a stand-in for it: this is the call whose own
 	// bookkeeping used to decide whether the next round would run.
-	smart.probeMember(context.Background(), member, keepWarm(member))
+	smart.probeMember(context.Background(), member, naive.ProbeDestination())
 	require.True(t, member.healthy.Load(), "the probe answered")
 	local, banked := member.local()
 	require.True(t, banked, "everything else the probe taught is kept — only the stamp is not")
@@ -699,4 +748,395 @@ func TestAnUnhealthyMemberIsProbedNoMatterHowRecentlyItWasSeen(t *testing.T) {
 	member.healthy.Store(false)
 	require.Len(t, smart.dueForHeartbeat(time.Now()), 1,
 		"an unhealthy member is probed however recently it was used")
+}
+
+// countingOutbound records that it was dialed and fails, the way a node that is
+// blackholed fails after a while.
+type countingOutbound struct {
+	adapter.Outbound
+	dials atomic.Int32
+}
+
+func (o *countingOutbound) Network() []string { return []string{N.NetworkTCP} }
+
+func (o *countingOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	o.dials.Add(1)
+	return nil, context.DeadlineExceeded
+}
+
+func TestAGroupThatIsDownIsNotOfferedWhileAnotherIsUp(t *testing.T) {
+	t.Parallel()
+	// A single-member group whose member is condemned used to be offered like
+	// any other, so every connection to a destination it had won went there
+	// first and paid the timeout before failing over.
+	hkOut := &countingOutbound{}
+	hk := newMember("out-hk", ms(31))
+	hk.outbound = hkOut
+	hk.healthy.Store(false)
+	jpOut := &answeringOutbound{measurement: answering(ms(59), ms(1))}
+	jp := newMember("out-jp", ms(59))
+	jp.outbound = jpOut
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "hk", members: []*smartMember{hk}},
+			{tag: "jp", members: []*smartMember{jp}},
+		},
+	}
+	destination := M.ParseSocksaddr("example.com:443")
+	key := destinationKey(destination)
+	s.cache.store(key, &destinationEntry{
+		Remote:   map[string]remoteWindow{"hk": {ms(1)}, "jp": {ms(1)}},
+		Path:     map[string]time.Duration{"hk": ms(31), "jp": ms(59)},
+		Selected: "hk",
+		RacedAt:  time.Now(),
+	})
+
+	conn, err := s.dialTCP(context.Background(), destination)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.Zero(t, hkOut.dials.Load())
+	require.EqualValues(t, 1, jpOut.dials.Load())
+	require.Equal(t, "jp", s.cache.load(key).selected())
+
+	// With nothing up anywhere, something still has to be tried.
+	jp.healthy.Store(false)
+	require.Len(t, s.candidates(s.cache.load(key), 443, time.Now()), 2)
+}
+
+// portRefusingOutbound is an exit that cannot reach one port of anything —
+// outbound SMTP blocked by its provider, the common case.
+type portRefusingOutbound struct {
+	adapter.Outbound
+	refused uint16
+}
+
+func (o *portRefusingOutbound) Network() []string { return []string{N.NetworkTCP} }
+
+func (o *portRefusingOutbound) DialContext(_ context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
+	if destination.Port == o.refused {
+		return &refusingConn{}, nil
+	}
+	return &answeringConn{measurement: answering(ms(30), ms(1))}, nil
+}
+
+func TestARefusalOnOnePortLeavesTheHostsOtherPortsAlone(t *testing.T) {
+	t.Parallel()
+	// The snapshot is per host, and the cooldown used to be filed on it. One
+	// refused port on every group then failed every other port of the host
+	// outright, for five minutes and doubling.
+	a := newMember("a-1", ms(30))
+	a.outbound = &portRefusingOutbound{refused: 25}
+	b := newMember("b-1", ms(60))
+	b.outbound = &portRefusingOutbound{refused: 25}
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "a", members: []*smartMember{a}},
+			{tag: "b", members: []*smartMember{b}},
+		},
+	}
+	smtp := M.ParseSocksaddr("mail.example.com:25")
+	submission := M.ParseSocksaddr("mail.example.com:465")
+	key := destinationKey(smtp)
+	s.cache.store(key, &destinationEntry{
+		Remote:   map[string]remoteWindow{"a": {ms(1)}, "b": {ms(1)}},
+		Path:     map[string]time.Duration{"a": ms(30), "b": ms(60)},
+		Selected: "a",
+		RacedAt:  time.Now(),
+	})
+
+	conn, err := s.dialTCP(context.Background(), smtp)
+	require.NoError(t, err)
+	_, err = conn.Read(make([]byte, 1))
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	conn.Close()
+	entry := s.cache.load(key)
+	require.True(t, entry.blocked("a", 25, a, time.Now()))
+	require.True(t, entry.blocked("b", 25, b, time.Now()))
+
+	_, err = s.dialTCP(context.Background(), smtp)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable,
+		"every group refused it, so it leaves as a verdict about the destination, not about this node")
+	require.NotErrorIs(t, err, naive.ErrNextHopUnreachable)
+
+	conn, err = s.dialTCP(context.Background(), submission)
+	require.NoError(t, err, "another port of the same host is untouched")
+	conn.Close()
+}
+
+func TestAGroupThatWasDownDuringARefreshComesBackWithItsMeasurements(t *testing.T) {
+	t.Parallel()
+	// A group left out for being down is not raced, and a group that does not
+	// answer a round is dropped from the snapshot it writes. So a destination
+	// refreshed during the outage forgot the group, and once the group was back
+	// it could not be selected until the next refresh, hours later.
+	hk := newMember("out-hk", ms(31))
+	hk.outbound = &answeringOutbound{measurement: answering(ms(31), ms(1))}
+	hk.healthy.Store(false)
+	jp := newMember("out-jp", ms(59))
+	jp.outbound = &answeringOutbound{measurement: answering(ms(59), ms(1))}
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "hk", members: []*smartMember{hk}},
+			{tag: "jp", members: []*smartMember{jp}},
+		},
+	}
+	destination := M.ParseSocksaddr("example.com:443")
+	key := destinationKey(destination)
+	s.cache.store(key, &destinationEntry{
+		Remote:   map[string]remoteWindow{"hk": {ms(1)}, "jp": {ms(1)}},
+		Path:     map[string]time.Duration{"hk": ms(31), "jp": ms(59)},
+		Selected: "jp", // where the outage moved it
+		RacedAt:  time.Now(),
+	})
+
+	_, _, conn, err := s.race(context.Background(), key, destination, nil)
+	require.NoError(t, err)
+	conn.Close()
+
+	hk.healthy.Store(true)
+	entry := s.cache.load(key)
+	_, measured := entry.remoteFor("hk")
+	require.True(t, measured, "the refresh must not forget a group it could not ask")
+	selected, _ := selectGroup(testAlpha, s.candidates(entry, 443, time.Now()), entry.selected())
+	require.Equal(t, "hk", selected)
+}
+
+func TestAGroupThatIsDownIsNotTriedWhereEveryGroupUpHasRefused(t *testing.T) {
+	t.Parallel()
+	// Every group that is up refused the destination and is cooling down. The
+	// one that is down used to be offered then, as if nothing were up: every
+	// connection paid its readiness timeout and the failure came back as this
+	// node's fault, so a relay answered 503 instead of 502.
+	hkOut := &countingOutbound{}
+	hk := newMember("out-hk", ms(31))
+	hk.outbound = hkOut
+	hk.healthy.Store(false)
+	refuseAll := func(M.Socksaddr) bool { return false }
+	a := newMember("a-1", ms(130))
+	a.outbound = &egressOutbound{reach: refuseAll, dialed: make(chan M.Socksaddr, 8)}
+	b := newMember("b-1", ms(140))
+	b.outbound = &egressOutbound{reach: refuseAll, dialed: make(chan M.Socksaddr, 8)}
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "hk", members: []*smartMember{hk}},
+			{tag: "a", members: []*smartMember{a}},
+			{tag: "b", members: []*smartMember{b}},
+		},
+	}
+	destination := M.ParseSocksaddr("[2001:db8::1]:443")
+	key := destinationKey(destination)
+	s.cache.store(key, &destinationEntry{
+		Remote:   map[string]remoteWindow{"hk": {ms(1)}, "a": {ms(1)}, "b": {ms(1)}},
+		Path:     map[string]time.Duration{"hk": ms(31), "a": ms(130), "b": ms(140)},
+		Selected: "a",
+		RacedAt:  time.Now(),
+	})
+
+	conn, err := s.dialTCP(context.Background(), destination)
+	require.NoError(t, err)
+	_, err = conn.Read(make([]byte, 1))
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	conn.Close()
+
+	_, err = s.dialTCP(context.Background(), destination)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	require.NotErrorIs(t, err, naive.ErrNextHopUnreachable)
+	require.Zero(t, hkOut.dials.Load())
+}
+
+func TestAPortOneExitBlocksDoesNotMoveTheHost(t *testing.T) {
+	t.Parallel()
+	// The snapshot is per host. A connection to the port the selected exit
+	// refuses goes elsewhere, but moving the host there moved its other ports
+	// too: 25 and 465 alternating switched it back and forth, and inside the
+	// hysteresis 465 stayed on the slower exit until the next refresh.
+	hk := newMember("out-hk", ms(31))
+	hk.outbound = &portRefusingOutbound{refused: 25}
+	jpOut := &answeringOutbound{measurement: answering(ms(59), ms(1))}
+	jp := newMember("out-jp", ms(59))
+	jp.outbound = jpOut
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "hk", members: []*smartMember{hk}},
+			{tag: "jp", members: []*smartMember{jp}},
+		},
+	}
+	smtp := M.ParseSocksaddr("mail.example.com:25")
+	key := destinationKey(smtp)
+	s.cache.store(key, &destinationEntry{
+		Remote:   map[string]remoteWindow{"hk": {ms(1)}, "jp": {ms(1)}},
+		Path:     map[string]time.Duration{"hk": ms(31), "jp": ms(59)},
+		Selected: "hk",
+		RacedAt:  time.Now(),
+	})
+
+	for range 2 {
+		conn, err := s.dialTCP(context.Background(), smtp)
+		require.NoError(t, err)
+		_, _ = conn.Read(make([]byte, 1))
+		conn.Close()
+	}
+	require.EqualValues(t, 2, jpOut.dials.Load(), "25 goes to the exit that can reach it")
+	require.Equal(t, "hk", s.cache.load(key).selected(), "and the host stays where its other ports are")
+}
+
+func TestARoundAMemberRefusedJustBeforeItWasCondemnedIsRaced(t *testing.T) {
+	t.Parallel()
+	// An exit losing its egress answers 502 for everything until the
+	// heartbeat condemns its member a minute or two later. A destination first
+	// raced in that window lost the group for the snapshot's whole lifetime:
+	// neither the backup taking over nor the member coming back re-raced it.
+	main := newMember("us-main", ms(130))
+	spare := newMember("us-so", ms(140))
+	jp := newMember("jp-1", ms(59))
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "us", members: []*smartMember{main, spare}},
+			{tag: "jp", members: []*smartMember{jp}},
+		},
+	}
+	racedAt := time.Now().Add(-time.Minute)
+	snapshot := func() *destinationEntry {
+		return &destinationEntry{
+			Remote:  map[string]remoteWindow{"jp": {ms(1)}},
+			Path:    map[string]time.Duration{"jp": ms(59)},
+			Members: map[string]string{"us": "us-main", "jp": "jp-1"},
+			RacedAt: racedAt,
+		}
+	}
+	condemn := func(at time.Time) {
+		main.healthy.Store(false)
+		main.downAt.Store(at.UnixNano())
+	}
+
+	condemn(racedAt.Add(90 * time.Second))
+	entry := snapshot()
+	require.True(t, s.supersededRace(entry, s.candidates(entry, 443, time.Now()), time.Now()),
+		"the backup took over: race it")
+	main.healthy.Store(true)
+	require.True(t, s.supersededRace(entry, s.candidates(entry, 443, time.Now()), time.Now()),
+		"the member came back: still race it")
+
+	condemn(racedAt.Add(time.Hour))
+	main.healthy.Store(true)
+	entry = snapshot()
+	require.False(t, s.supersededRace(entry, s.candidates(entry, 443, time.Now()), time.Now()),
+		"a condemnation long after the round is a different outage")
+}
+
+func TestAnImmediateRefusalIsReportedWhenNoOtherGroupIsLeft(t *testing.T) {
+	t.Parallel()
+	// The selected group refused at dial time and every other group was
+	// already cooling down. The refusal was dropped on the way out, and the
+	// error said nothing was usable here — a 503 from a relay, for what was a
+	// verdict about the destination.
+	hk := newMember("out-hk", ms(31))
+	hk.outbound = &failingOutbound{err: fmt.Errorf("%w: %w: unexpected response status: 502",
+		naive.ErrDestinationUnreachable, naive.ErrProxyAnswered)}
+	jp := newMember("out-jp", ms(59))
+	jp.outbound = &countingOutbound{}
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "hk", members: []*smartMember{hk}},
+			{tag: "jp", members: []*smartMember{jp}},
+		},
+	}
+	destination := M.ParseSocksaddr("example.com:443")
+	entry := &destinationEntry{
+		Remote:   map[string]remoteWindow{"hk": {ms(1)}, "jp": {ms(1)}},
+		Path:     map[string]time.Duration{"hk": ms(31), "jp": ms(59)},
+		Selected: "hk",
+		RacedAt:  time.Now(),
+	}
+	entry.block("jp", 443, time.Now(), nil)
+	s.cache.store(destinationKey(destination), entry)
+
+	_, err := s.dialTCP(context.Background(), destination)
+	require.ErrorIs(t, err, naive.ErrDestinationUnreachable)
+	require.NotErrorIs(t, err, naive.ErrNextHopUnreachable)
+}
+
+// udpOutbound hands out packet connections and records that they were closed.
+type udpOutbound struct {
+	adapter.Outbound
+	closed atomic.Int32
+}
+
+func (o *udpOutbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
+
+func (o *udpOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	return &closeCountingPacketConn{PacketConn: conn, closed: &o.closed}, nil
+}
+
+type closeCountingPacketConn struct {
+	net.PacketConn
+	closed *atomic.Int32
+}
+
+func (c *closeCountingPacketConn) Close() error {
+	c.closed.Add(1)
+	return c.PacketConn.Close()
+}
+
+func TestCondemningAMemberEndsTheUDPFlowsItCarries(t *testing.T) {
+	t.Parallel()
+	// A UDP flow is placed once, when it opens. An application that keeps
+	// sending on one socket stayed on a member that had been condemned for as
+	// long as it kept sending; ended, it opens a new flow, which is placed
+	// on what is up.
+	out := &udpOutbound{}
+	member := newMember("us-main", ms(130))
+	member.outbound = out
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{{tag: "us", members: []*smartMember{member}}},
+	}
+	// The condemnation schedules rechecks, which dial; this fake cannot.
+	t.Cleanup(func() { s.closed.Store(true) })
+	conn, err := s.ListenPacket(context.Background(), M.ParseSocksaddr("wg.example.com:51820"))
+	require.NoError(t, err)
+	defer conn.Close()
+	require.Zero(t, out.closed.Load())
+
+	s.markDown(member, errors.New("unreachable"))
+	require.EqualValues(t, 1, out.closed.Load())
+}
+
+func TestAnExitBackFromLosingItsEgressIsNotKeptOffWhatItRefused(t *testing.T) {
+	t.Parallel()
+	s, group, main, _ := egressFixture(func(M.Socksaddr) bool { return false })
+	destination := M.ParseSocksaddr("a.example:443")
+	key := destinationKey(destination)
+	s.reportFailure(key, destination, group, main, refused502)
+	entry := s.cache.load(key)
+	require.Empty(t, s.candidates(entry, destination.Port, time.Now()), "cooling on the member that refused it")
+
+	s.condemn(main, refused502)
+	candidates := s.candidates(entry, destination.Port, time.Now())
+	require.Len(t, candidates, 1, "the sibling standing in never refused it")
+	require.Equal(t, "spare", candidates[0].member)
+
+	s.record(main, answering(ms(130), ms(1)))
+	candidates = s.candidates(entry, destination.Port, time.Now())
+	require.Len(t, candidates, 1, "nor is the member that refused it while its egress was gone, now it is back")
+	require.Equal(t, "main", candidates[0].member)
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"hash/fnv"
 	"sort"
 	"sync"
@@ -13,8 +12,8 @@ import (
 
 	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/cachefile"
-	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing/common"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/contrab/freelru"
@@ -47,9 +46,11 @@ const (
 	//
 	// Four times that costs nothing measurable. The LRU is sharded and its fixed
 	// overhead dominates at these sizes — 198KiB either side of the change — and
-	// an entry is only built when a destination is actually decided, so what is
-	// held is what is used. The hourly state dump is likewise a line per entry
-	// that exists, not per slot.
+	// an entry is only built when a destination is actually dialed: decided by
+	// a race, or left empty to hold a failed round's backoff or a refusal's
+	// cooldown (see noteFailedRace and Smart.reportFailure). So what is held is
+	// what is used. The hourly state dump is likewise a line per entry that
+	// exists, the empty ones included, not per slot.
 	//
 	// Sharding means the usable figure is a few percent under the nominal one, a
 	// shard filling before its neighbours: 16384 holds a measured 15843.
@@ -190,7 +191,7 @@ func legacySmartKeys(bucket *bbolt.Bucket) [][]byte {
 // unlucky sample and sat out hours it would have won.
 //
 // Windows are treated as immutable: extend copies, nothing writes in place.
-// That is what lets carryIncumbent hand a window from one entry to the next
+// That is what lets carryOver hand a window from one entry to the next
 // without the two entries' locks having to know about each other.
 type remoteWindow []time.Duration
 
@@ -300,8 +301,8 @@ type destinationEntry struct {
 	// the same destination keeps leaving from the same address.
 	Selected string `json:"selected,omitempty"`
 	// Carried names the groups whose legs came from the previous snapshot
-	// rather than from the round that wrote this one. Exactly one group is ever
-	// in here — the one in use — and only for one round: see carryIncumbent.
+	// rather than from the round that wrote this one. Each only for one round:
+	// see carryOver.
 	Carried map[string]bool `json:"carried,omitempty"`
 	// Members maps group tag to the member that stood for the group in the round
 	// that wrote this snapshot — the losers included, and the groups that never
@@ -312,19 +313,20 @@ type destinationEntry struct {
 	// a verdict about the backup. The verdict then outlives the failover by
 	// hours: the group recovers in minutes, and nothing about a group that did
 	// not answer is stored for the drift check to notice. Keeping who was asked
-	// makes that detectable — see Smart.racedAgainstOtherMembers.
+	// makes that detectable — see destinationEntry.racedAgainstOthers and
+	// Smart.supersededRace.
 	Members map[string]string `json:"members,omitempty"`
 	// RacedAt is when the snapshot was taken.
 	RacedAt time.Time `json:"raced_at"`
-	// unreachable maps group tag to when its cooldown for this destination
-	// expires. It is deliberately not persisted: a proxy that could not reach
-	// something five minutes ago deserves a fresh chance after a restart.
-	unreachable map[string]time.Time
+	// unreachable maps a group and port to its cooldown for this destination.
+	// It is deliberately not persisted: a proxy that could not reach something
+	// five minutes ago deserves a fresh chance after a restart.
+	unreachable map[cooldownKey]cooldown
 	// refusals counts how many cooldowns in a row a group has earned for this
-	// destination, which is what the next one is doubled from. Cleared as soon
-	// as the group reaches the destination, and not persisted for the same
-	// reason unreachable is not.
-	refusals map[string]int
+	// destination and port, which is what the next one is doubled from. Cleared
+	// as soon as the group reaches the destination, and not persisted for the
+	// same reason unreachable is not.
+	refusals map[cooldownKey]int
 	// attempted is when a refresh was last tried, as opposed to RacedAt which is
 	// when one last succeeded. A race that finds nothing leaves RacedAt where it
 	// was, so without this the entry stays expired and every connection to the
@@ -592,34 +594,115 @@ func snapshotLifetime(destination string) time.Duration {
 	return snapshotTTL*3/4 + spread
 }
 
-func (e *destinationEntry) blocked(tag string, now time.Time) bool {
-	e.access.Lock()
-	defer e.access.Unlock()
-	until, found := e.unreachable[tag]
-	return found && now.Before(until)
+// cooldownKey is what a refusal is filed under. The snapshot is per host, but
+// a refusal is about one port: VPS providers commonly block outbound 25, and a
+// host serving only 443 refuses 80. Filed per host, one such refusal on every
+// group took the host off every port — 465 failing outright because 25 had.
+type cooldownKey struct {
+	tag  string
+	port uint16
 }
 
-func (e *destinationEntry) block(tag string, now time.Time) {
+// cooldown is one refusal on file: until when it keeps the group off the
+// port, and who earned it.
+//
+// The member and the moment are kept because a refusal is only as good as the
+// exit that gave it. An exit that has lost its own egress refuses everything,
+// and each destination it refused was filed for five minutes — so the member
+// coming back, or the group moving to a sibling that never lost anything,
+// still found every one of them off limits until its cooldown ran out. See
+// applies.
+type cooldown struct {
+	until time.Time
+	by    *smartMember
+	filed int64
+}
+
+// applies reports whether this cooldown still speaks for the member a group
+// would use now. It does not once that is a different member, nor once the
+// member that filed it has been condemned since: what it was refusing then is
+// explained by what condemned it, and whatever it refuses after coming back is
+// filed afresh. A cooldown with nobody named on it applies as filed.
+func (c cooldown) applies(member *smartMember, now time.Time) bool {
+	if !now.Before(c.until) {
+		return false
+	}
+	return c.by == nil || (c.by == member && c.by.downAt.Load() <= c.filed)
+}
+
+// blocked reports whether a cooldown keeps a group off this port, judged for
+// the member the group would use; see cooldown.applies.
+func (e *destinationEntry) blocked(tag string, port uint16, member *smartMember, now time.Time) bool {
+	e.access.Lock()
+	defer e.access.Unlock()
+	c, found := e.unreachable[cooldownKey{tag, port}]
+	return found && c.applies(member, now)
+}
+
+// blockedOnAnyPort is blocked for the state dump, which is per host.
+func (e *destinationEntry) blockedOnAnyPort(tag string, member *smartMember, now time.Time) bool {
+	e.access.Lock()
+	defer e.access.Unlock()
+	for key, c := range e.unreachable {
+		if key.tag == tag && c.applies(member, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// cooldownKeysCap bounds the cooldowns one snapshot holds.
+//
+// Filed per group and port, they had no bound, and an expired one was only
+// ever removed by the group reaching that port again. A port scan through one
+// host — every group refusing every port — filed 100000 of them, 12MiB that
+// stayed for as long as anything kept using the host, and that every refresh
+// copied whole. Five groups each refusing a dozen ports of one host stay
+// under it.
+//
+// ponytail: when it is full, expired cooldowns are dropped to make room, their
+// escalation with them; with none expired, the new refusal is not remembered,
+// and the next connection to that port dials again as it would have before any
+// cooldown existed.
+const cooldownKeysCap = 64
+
+// block files a refusal by the member by, which is standing for the group.
+func (e *destinationEntry) block(tag string, port uint16, now time.Time, by *smartMember) {
 	e.access.Lock()
 	defer e.access.Unlock()
 	if e.unreachable == nil {
-		e.unreachable = make(map[string]time.Time)
+		e.unreachable = make(map[cooldownKey]cooldown)
 	}
 	if e.refusals == nil {
-		e.refusals = make(map[string]int)
+		e.refusals = make(map[cooldownKey]int)
 	}
-	e.refusals[tag]++
-	e.unreachable[tag] = now.Add(cooldownAfter(e.refusals[tag]))
+	key := cooldownKey{tag, port}
+	if _, held := e.unreachable[key]; !held && len(e.unreachable) >= cooldownKeysCap {
+		for stale, c := range e.unreachable {
+			if !now.Before(c.until) {
+				delete(e.unreachable, stale)
+				delete(e.refusals, stale)
+			}
+		}
+		if len(e.unreachable) >= cooldownKeysCap {
+			return
+		}
+	}
+	e.refusals[key]++
+	e.unreachable[key] = cooldown{until: now.Add(cooldownAfter(e.refusals[key])), by: by, filed: now.UnixNano()}
 }
 
 // reached clears what a group earned for refusing this destination, because it
-// has just carried it. Called for the groups a round measured, which is the
-// only evidence that the refusal is over.
-func (e *destinationEntry) reached(tag string) {
+// has just carried it. Called for the groups a round measured on this port,
+// which is the only evidence that the refusal is over: reaching the host on
+// 443 says nothing about 25, and clearing 25's run there reset its doubling
+// on every refresh of a busy host.
+func (e *destinationEntry) reached(tag string, port uint16) {
 	e.access.Lock()
 	defer e.access.Unlock()
-	delete(e.refusals, tag)
-	delete(e.unreachable, tag)
+	key := cooldownKey{tag, port}
+	delete(e.refusals, key)
+	delete(e.unreachable, key)
 }
 
 // cooldownAfter reports how long the nth consecutive refusal keeps a group off
@@ -635,8 +718,9 @@ func cooldownAfter(refusals int) time.Duration {
 	return cooldown
 }
 
-// carryIncumbent keeps the group in use in the snapshot when the round that
-// produced this one did not re-measure it.
+// carryOver keeps a group's legs in the snapshot when the round that produced
+// it did not re-measure them: the group in use, and any group the round could
+// not ask or was refused by.
 //
 // A race stores only what answered, so a round the incumbent sat out leaves it
 // with no destination leg — and a group with no leg cannot be scored, so
@@ -647,29 +731,22 @@ func cooldownAfter(refusals int) time.Duration {
 // prevent, and it was measured: one host cycling through all five exits in
 // twenty minutes.
 //
-// Three things keep the stale value from outstaying its welcome. Only the
-// incumbent is carried, so nothing else is ranked on old numbers. It is not
-// carried if it failed this round, because that is evidence rather than
-// silence. And it is carried for one round only — a group that stays quiet
-// through two loses its place, which is what stops a value surviving
-// indefinitely on a destination nobody can reach.
-func (e *destinationEntry) carryIncumbent(previous *destinationEntry, tag string, failure error) {
+// The others are carried because what kept them out says nothing about the
+// host the snapshot is for. A group left out for being down was never asked,
+// and dropping it would leave it unselectable here until the next refresh,
+// hours after it is back. A refusal — this round's, or the cooldown that kept
+// it out of the round — is about one port, and the snapshot is per host: a
+// refresh that happened to run on a port an exit blocks used to drop that exit
+// for every port of the host. The port's cooldown already keeps it off that
+// port.
+//
+// Carrying is for one round only — a group that stays out through two loses
+// its place, which is what stops a value surviving indefinitely on a
+// destination nobody can reach, and what retires a group that refuses the
+// host on every port. Only these groups are carried, so nothing that simply
+// lost is ranked on old numbers.
+func (e *destinationEntry) carryOver(previous *destinationEntry, tag string) {
 	if previous == nil || tag == "" {
-		return
-	}
-	if errors.Is(failure, naive.ErrDestinationUnreachable) {
-		// The proxy answered, and what it said was that it could not reach this
-		// destination. That is a measurement of a sort, and carrying the old one
-		// over the top of it would hide the only real news in the round.
-		//
-		// Every other failure is about the leg to the proxy — a pooled
-		// connection that died, a reset, a refused dial — and says nothing
-		// whatever about this destination. Retiring the group's leg for one of
-		// those costs it its eligibility for the whole snapshot lifetime, since
-		// a group with no measurement cannot be selected: seen on
-		// lh3.googleusercontent.com, where one "connection closed" during a
-		// refresh moved a CDN scoring -8ms onto a group scoring 22ms and left
-		// it there for six hours.
 		return
 	}
 	if _, measured := e.Remote[tag]; measured {
@@ -696,7 +773,10 @@ func (e *destinationEntry) carryIncumbent(previous *destinationEntry, tag string
 		e.Path = make(map[string]time.Duration, 1)
 	}
 	e.Remote[tag], e.Path[tag] = remote, local
-	e.Carried = map[string]bool{tag: true}
+	if e.Carried == nil {
+		e.Carried = make(map[string]bool, 1)
+	}
+	e.Carried[tag] = true
 }
 
 // carried reports whether a group's legs in this snapshot were measured or
@@ -725,16 +805,16 @@ func (e *destinationEntry) carryCooldowns(previous *destinationEntry) {
 	if len(previous.unreachable) == 0 && len(previous.refusals) == 0 {
 		return
 	}
-	e.unreachable = make(map[string]time.Time, len(previous.unreachable))
-	for tag, until := range previous.unreachable {
-		e.unreachable[tag] = until
+	e.unreachable = make(map[cooldownKey]cooldown, len(previous.unreachable))
+	for key, c := range previous.unreachable {
+		e.unreachable[key] = c
 	}
 	// The run of refusals moves with the cooldown it sets the length of.
 	// Leaving it behind would reset every escalation on the next round, which
 	// for a destination nothing can reach is every five minutes for ever.
-	e.refusals = make(map[string]int, len(previous.refusals))
-	for tag, count := range previous.refusals {
-		e.refusals[tag] = count
+	e.refusals = make(map[cooldownKey]int, len(previous.refusals))
+	for key, count := range previous.refusals {
+		e.refusals[key] = count
 	}
 }
 
@@ -808,16 +888,50 @@ type smartCache struct {
 	// dirty tracks the destinations changed since the last flush, so a flush
 	// writes what moved rather than walking the whole cache.
 	dirty map[string]bool
+	// evicted is what the cache pushed out since the last flush, whose rows
+	// that flush deletes. Without it the rows outlived the entries: a run
+	// meeting sixty thousand destinations left sixty thousand rows, and the
+	// next start spent two seconds and 145MiB of heap reading them back only
+	// to keep the newest 16384.
+	evicted map[string]bool
+	size    int
+	// flushing keeps flushes from overlapping. Each takes its marks under
+	// access and writes after letting go, so two at once could land out of
+	// order: an older value over a newer one, or a deletion after the row
+	// written for a destination decided again.
+	flushing sync.Mutex
 }
 
 func newSmartCache(ctx context.Context, tag string) *smartCache {
-	return &smartCache{
-		entries: common.Must1(freelru.New[string, *destinationEntry](
-			destinationCacheSize, maphash.NewHasher[string]().Hash32, true)),
-		owner: []byte(tag),
-		dirty: make(map[string]bool),
-		ctx:   ctx,
+	if C.IsIos {
+		// A network extension is killed at about 50MB. Full, the table holds
+		// 27.5MiB, and reading it back at start takes 35MiB more on top.
+		return newSmartCacheSized(ctx, tag, destinationCacheSize/4)
 	}
+	return newSmartCacheSized(ctx, tag, destinationCacheSize)
+}
+
+// newSmartCacheSized is newSmartCache at a capacity a test can fill.
+func newSmartCacheSized(ctx context.Context, tag string, size int) *smartCache {
+	c := &smartCache{
+		entries: common.Must1(freelru.New[string, *destinationEntry](
+			uint32(size), maphash.NewHasher[string]().Hash32, true)),
+		owner:   []byte(tag),
+		dirty:   make(map[string]bool),
+		evicted: make(map[string]bool),
+		size:    size,
+		ctx:     ctx,
+	}
+	// Runs inside an Add that pushes something out: under c.access, which
+	// every use of entries holds, and under the shard's own lock, so it may
+	// touch nothing but this map. Without a database there is nothing to
+	// delete and the set would only grow.
+	c.entries.SetOnEvict(func(destination string, _ *destinationEntry) {
+		if c.persistent() {
+			c.evicted[destination] = true
+		}
+	})
+	return c
 }
 
 // rows is this outbound's snapshots, or nil when none have been written yet.
@@ -833,7 +947,7 @@ func (c *smartCache) db() *bbolt.DB {
 	if !c.persistent() {
 		return nil
 	}
-	return c.cacheFile.DB
+	return c.cacheFile.Database()
 }
 
 // persistent reports whether a cache file service exists at all. It answers a
@@ -893,19 +1007,26 @@ func (c *smartCache) touch(destination string) {
 
 // preload reads the whole bucket into memory and compacts it.
 //
-// Nothing is deleted as decisions are made, so without this the file would grow
-// for every destination ever visited and be read back in full at every start.
-// Keeping the newest and dropping the rest bounds both.
+// A flush deletes the rows of the entries the cache pushed out (see
+// smartCache.evicted), so what is left for this is the rows nothing pushed
+// out: snapshots past their retention, rows that no longer decode, and more
+// rows than the cache holds — left by a run that stopped before its flush, or
+// by a version from before flushes deleted them. Without this the file would
+// keep those and read them back in full at every start. Keeping the newest and
+// dropping the rest bounds both.
 func (c *smartCache) preload() {
-	db := c.db()
-	if db == nil {
+	if c.db() == nil {
 		return
 	}
-	c.tidy(db)
+	// Transactions go through the cache file rather than the handle, here
+	// and in tidy and flush: it reads the handle under the lock that guards
+	// its replacement, and resets a corrupt file instead of panicking.
+	file := c.cacheFile
+	c.tidy(file)
 	now := time.Now()
 	stored := make(map[string]*destinationEntry)
 	var abandoned []string
-	_ = db.View(func(tx *bbolt.Tx) error {
+	_ = file.View(func(tx *bbolt.Tx) error {
 		bucket := c.ownBucket(tx)
 		if bucket == nil {
 			return nil
@@ -922,13 +1043,30 @@ func (c *smartCache) preload() {
 				abandoned = append(abandoned, string(key))
 				return nil
 			}
+			// A row dated in the future is kept as written. The clock that is
+			// wrong may be this one, started behind (no RTC, a restored VM),
+			// and its date is the only record of when it was raced: dating it
+			// by a wrong clock, in memory or on disk, is what loses it. One
+			// raced under a clock set ahead stays fresh until the clock
+			// catches up, within snapshotUseLimit and the LRU.
 			stored[string(key)] = &decoded
 			return nil
 		})
 	})
 
-	dropped := surplusEntries(stored, destinationCacheSize)
+	dropped := surplusEntries(stored, c.size)
 	c.access.Lock()
+	// Decided while the bucket was being read, so not on disk to load back,
+	// and the oldest entry in its shard by the time the loop below adds to
+	// it — the first thing an old row would push out, taking the newer
+	// decision with it and leaving last run's row to come back next start.
+	// Put back afterwards, so what makes room is an old row.
+	fresh := make(map[string]*destinationEntry)
+	for _, destination := range c.entries.Keys() {
+		if entry, live := c.entries.Peek(destination); live {
+			fresh[destination] = entry
+		}
+	}
 	for destination, entry := range stored {
 		if dropped[destination] {
 			continue
@@ -942,6 +1080,9 @@ func (c *smartCache) preload() {
 			// the fresh row under the entry's still-standing dirty mark.
 			continue
 		}
+		c.entries.Add(destination, entry)
+	}
+	for destination, entry := range fresh {
 		c.entries.Add(destination, entry)
 	}
 	for _, destination := range abandoned {
@@ -968,7 +1109,7 @@ func (c *smartCache) preload() {
 	if len(dropped) == 0 {
 		return
 	}
-	_ = db.Batch(func(tx *bbolt.Tx) error {
+	_ = file.Batch(func(tx *bbolt.Tx) error {
 		bucket := c.ownBucket(tx)
 		if bucket == nil {
 			return nil
@@ -988,9 +1129,9 @@ func (c *smartCache) preload() {
 //
 // Failures are dropped: a cache file that cannot be tidied must never stop the
 // snapshots that can be read from being read, and the next start tries again.
-func (c *smartCache) tidy(db *bbolt.DB) {
+func (c *smartCache) tidy(file *cachefile.CacheFile) {
 	horizon := time.Now().Add(-snapshotRetention)
-	_ = db.Batch(func(tx *bbolt.Tx) error {
+	_ = file.Batch(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(smartBucket)
 		if bucket == nil {
 			return nil
@@ -1093,10 +1234,12 @@ func surplusEntries(stored map[string]*destinationEntry, limit int) map[string]b
 
 // flush writes the destinations that changed since the last call.
 func (c *smartCache) flush() error {
-	db := c.db()
-	if db == nil {
+	if c.db() == nil {
 		return nil
 	}
+	file := c.cacheFile
+	c.flushing.Lock()
+	defer c.flushing.Unlock()
 	c.access.Lock()
 	pending := make(map[string]*destinationEntry, len(c.dirty))
 	for destination := range c.dirty {
@@ -1105,12 +1248,21 @@ func (c *smartCache) flush() error {
 		}
 	}
 	c.dirty = make(map[string]bool)
+	var gone []string
+	for destination := range c.evicted {
+		// Peek, so that asking does not move it: one pushed out and then
+		// decided again is live, and its row is the one about to be written.
+		if _, live := c.entries.Peek(destination); !live {
+			gone = append(gone, destination)
+		}
+	}
+	c.evicted = make(map[string]bool)
 	c.access.Unlock()
 
-	if len(pending) == 0 {
+	if len(pending) == 0 && len(gone) == 0 {
 		return nil
 	}
-	err := db.Batch(func(tx *bbolt.Tx) error {
+	err := file.Batch(func(tx *bbolt.Tx) error {
 		parent, createErr := tx.CreateBucketIfNotExists(smartBucket)
 		if createErr != nil {
 			return createErr
@@ -1118,6 +1270,11 @@ func (c *smartCache) flush() error {
 		bucket, createErr := parent.CreateBucketIfNotExists(c.owner)
 		if createErr != nil {
 			return createErr
+		}
+		for _, destination := range gone {
+			if deleteErr := bucket.Delete([]byte(destination)); deleteErr != nil {
+				return deleteErr
+			}
 		}
 		for destination, entry := range pending {
 			encoded, marshalErr := entry.marshal()
@@ -1138,6 +1295,9 @@ func (c *smartCache) flush() error {
 		c.access.Lock()
 		for destination := range pending {
 			c.dirty[destination] = true
+		}
+		for _, destination := range gone {
+			c.evicted[destination] = true
 		}
 		c.access.Unlock()
 	}

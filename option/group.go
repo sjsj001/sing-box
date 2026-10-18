@@ -31,8 +31,9 @@ type SmartOutboundOptions struct {
 	Alpha *float64 `json:"alpha,omitempty"`
 	// AuditPath turns on a durable record of every routing decision and the
 	// measurements behind it, written as one JSON object per line. It is off
-	// unless set, because it is the only place destination names reach the disk
-	// in the clear — the snapshot cache stores digests.
+	// unless set, because it writes destination names to disk in the clear —
+	// the snapshot cache stores digests, though the cache file's fakeip, rdrc
+	// and dns buckets hold names too when those are stored.
 	AuditPath string `json:"audit_path,omitempty"`
 	// AuditSize is how large the trail grows before it is rotated, keeping one
 	// previous generation. Default 64 MiB.

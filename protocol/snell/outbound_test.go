@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	snellprotocol "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/snellv4"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -494,3 +495,23 @@ func startTestSnellOutbound(t *testing.T, outbound *Outbound) *adapter.Scope {
 	require.NoError(t, outbound.Start(adapter.StartStateInitialize, scope))
 	return scope
 }
+
+// The client's first record of a connection: the cost a v5 outbound pays per
+// new connection, reuse session and UoT session before its first byte leaves.
+// Its padding dominates it.
+func BenchmarkClientFirstRecord(b *testing.B) {
+	client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte("test-password")})
+	require.NoError(b, err)
+	request := []byte("GET /1000 HTTP/1.1\r\nHost: 127.0.0.1:18081\r\nUser-Agent: curl/8.0\r\nAccept: */*\r\n\r\n")
+	destination := M.ParseSocksaddr("127.0.0.1:18081")
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			conn := client.DialEarlyConn(discardConn{}, destination)
+			_, _ = conn.Write(request)
+		}
+	})
+}
+
+type discardConn struct{ net.Conn }
+
+func (discardConn) Write(p []byte) (int, error) { return len(p), nil }

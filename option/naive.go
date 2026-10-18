@@ -8,9 +8,10 @@ import (
 
 type NaiveInboundOptions struct {
 	ListenOptions
-	Users                 []auth.User `json:"users,omitempty"`
-	Network               NetworkList `json:"network,omitempty"`
-	QUICCongestionControl string      `json:"quic_congestion_control,omitempty" enum:"bbr,cubic,reno"`
+	Users                 []auth.User        `json:"users,omitempty"`
+	Network               NetworkList        `json:"network,omitempty"`
+	QUICCongestionControl string             `json:"quic_congestion_control,omitempty" enum:"bbr,cubic,reno"`
+	SendQueueTarget       badoption.Duration `json:"send_queue_target,omitempty"`
 	InboundTLSOptionsContainer
 }
 

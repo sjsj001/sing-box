@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -46,15 +47,24 @@ type Outbound struct {
 	uotClient *uot.Client
 }
 
-// Pools reports how many isolated connection pools streams are spread over, so
-// a caller that wants none of them cold knows how many connections to open.
+// Pools reports how many isolated connection pools streams are spread over.
 // With no explicit insecure_concurrency the pools are adaptive and this is a
-// live count, so a warmup pass tracks demand instead of a constant.
+// live count. Only tests read it, to see the pools grow and shrink.
 func (h *Outbound) Pools() int {
 	return h.client.Pools()
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveOutboundOptions) (adapter.Outbound, error) {
+	// 16 is the adaptive pools' own cap (cronet-go pool.maxPoolCap). Below 0
+	// meant one fixed connection; above, as many connections — or, with QUIC,
+	// engines — as asked.
+	if options.InsecureConcurrency < 0 || options.InsecureConcurrency > 16 {
+		return nil, E.New("insecure_concurrency must be between 0 and 16")
+	}
+	// Chromium reads both as int32 and silently drops a larger value.
+	if options.ReceiveWindow.Value() > math.MaxInt32 || options.QUICSessionReceiveWindow.Value() > math.MaxInt32 {
+		return nil, E.New("stream_receive_window and quic_session_receive_window must be under 2GiB")
+	}
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
 	}
@@ -195,6 +205,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	default:
 		return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
 	}
+	receiveWindow := options.ReceiveWindow.Value()
+	if receiveWindow == 0 && options.Detour != "" && !options.QUIC {
+		// Stream windows are auto-tuned on the RTT of the socket this dialer
+		// hands cronet, which through a detour is only the hop to that
+		// outbound; the default window, given explicitly, stays fixed.
+		receiveWindow = cronet.DefaultH2ReceiveWindow()
+	}
 	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
 		Context:             ctx,
 		Logger:              logger,
@@ -205,7 +222,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		InsecureConcurrency: options.InsecureConcurrency,
 		ExtraHeaders:        extraHeaders,
 		// Session window; cronet advertises half of it per stream.
-		ReceiveWindow:            options.ReceiveWindow.Value(),
+		ReceiveWindow:            receiveWindow,
 		TrustedRootCertificates:  trustedRootCertificates,
 		Dialer:                   outboundDialer,
 		DNSResolver:              dnsResolver,
@@ -258,7 +275,11 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+		if IsProbeContext(ctx) {
+			h.logger.DebugContext(ctx, "outbound connection to ", destination)
+		} else {
+			h.logger.InfoContext(ctx, "outbound connection to ", destination)
+		}
 		conn, err := dialEarly(ctx, h.client, destination)
 		if err != nil {
 			return nil, err
@@ -371,6 +392,11 @@ type dialConn struct {
 	cronet.NaiveConn
 }
 
+// The half-close comes from cronet-go, promoted through the embedded interface.
+// A cronet-go without it still compiles and the copy loop quietly closes
+// instead, so the build is made to fail here rather than ship that.
+var _ N.WriteCloser = (*dialConn)(nil)
+
 // localClose re-labels the transport's "this end closed it" as this package's,
 // so that the code which has to recognise it can do so without importing the
 // transport — which is behind a build tag that code is not. Everything else is
@@ -378,9 +404,36 @@ type dialConn struct {
 // put on it: a local close still has to reach a relay as a hop-level failure,
 // because an error that arrives unclassified is answered with the status that
 // downstream reads as a licence to replay the payload.
+//
+// A stream the proxy refused unprocessed is labelled here too, for the same
+// reason and so that WaitReady carries it: the three methods share this, and
+// only two of them classify.
+//
+// So are ERR_ABORTED and ERR_NETWORK_CHANGED, which only this end produces:
+// the first is what CloseAllConnections fails every open stream with, the
+// second what Chromium's own network monitor does on a switch. Both are a local
+// close by another route, and on a network change they arrive together with
+// the probes meant to measure it: ResetNetwork calls the outbounds in
+// configuration order, so a smart group listed before its members has its
+// probes in flight when each member drops its sessions, and a healthy member
+// was condemned for a whole heartbeat on its own cleanup. cronet-go now
+// matches both to net.ErrClosed, but that only quiets the copy loop: what smart
+// checks is ErrClosedLocally, and it learns of these only from this label. Not
+// to be confused with ERR_CONNECTION_ABORTED, which is the network's doing and
+// stays a reading.
 func localClose(err error) error {
-	if err != nil && errors.Is(err, cronet.ErrClosedLocally) {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, cronet.ErrClosedLocally) {
 		return ErrClosedLocally
+	}
+	if errors.Is(err, cronet.NetErrorAborted) || errors.Is(err, cronet.NetErrorNetworkChanged) {
+		// Wrapped rather than replaced, so the trail still says which.
+		return fmt.Errorf("%w: %w", ErrClosedLocally, err)
+	}
+	if errors.Is(err, cronet.NetErrorHTTP2ServerRefusedStream) {
+		return fmt.Errorf("%w: %w", ErrStreamRefused, err)
 	}
 	return err
 }
@@ -429,6 +482,9 @@ func (c *dialConn) RemoteAck(ctx context.Context) (ConnectAck, bool, error) {
 // unreachable; anything else — including no answer at all — means the hop is
 // the part that is broken.
 func classifyHandshakeError(err error) error {
+	if errors.Is(err, ErrStreamRefused) {
+		return fmt.Errorf("%w: %w", ErrNextHopUnreachable, err)
+	}
 	var handshakeError *cronet.HandshakeError
 	if !errors.As(err, &handshakeError) {
 		// No status came back at all: a deadline, a dropped route, a session
@@ -436,8 +492,15 @@ func classifyHandshakeError(err error) error {
 		// tell this from the proxy refusing something — see the sentinel.
 		return fmt.Errorf("%w: %w", ErrNextHopUnreachable, err)
 	}
-	if handshakeError.StatusCode == http.StatusBadGateway {
+	switch handshakeError.StatusCode {
+	case http.StatusBadGateway:
 		return fmt.Errorf("%w: %w: %w", ErrDestinationUnreachable, ErrProxyAnswered, err)
+	case http.StatusMethodNotAllowed, http.StatusProxyAuthRequired:
+		// What a server answers a CONNECT whose credentials it does not
+		// accept: this one falls back to a web server's 405, others ask for
+		// authentication. Without saying so, a mistyped password reads as the
+		// proxy being unreachable.
+		return fmt.Errorf("%w: %w: the proxy rejected the request: check username and password: %w", ErrNextHopUnreachable, ErrProxyAnswered, err)
 	}
 	return fmt.Errorf("%w: %w: %w", ErrNextHopUnreachable, ErrProxyAnswered, err)
 }
@@ -446,6 +509,11 @@ func (c *dialConn) WaitReady(ctx context.Context) error {
 	return localClose(c.NaiveConn.WaitReady(ctx))
 }
 
+// No read waiter: a download through this connection waits in Read on the
+// copy's full buffer. Chromium holds a stream's data until the posted read is
+// full or a millisecond passes with nothing more, so on a paced download a
+// smaller buffer means more, smaller reads. Waiting on 16 KiB, a relay chain's
+// middle hop spent 7% to 33% more CPU per GB at 20 to 200 Mbps (round 28).
 func (c *dialConn) Upstream() any           { return c.NaiveConn }
 func (c *dialConn) ReaderReplaceable() bool { return true }
 func (c *dialConn) WriterReplaceable() bool { return true }

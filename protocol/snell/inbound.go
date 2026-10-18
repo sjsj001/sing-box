@@ -1,9 +1,13 @@
 package snell
 
 import (
+	"cmp"
 	"context"
+	"io"
 	"net"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -18,6 +22,7 @@ import (
 	"github.com/sagernet/sing-snell/snellv6"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
@@ -44,6 +49,9 @@ type Inbound struct {
 	udpNat     *quicProxyNATService
 	quicAuth   *quicProxyAuthenticationService
 	quicParser quicProxyInitParser
+	// handshakeTimeout overrides C.TCPTimeout as the bound on a client sending
+	// its request; zero means the constant. Set by tests.
+	handshakeTimeout time.Duration
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellInboundOptions) (adapter.Inbound, error) {
@@ -183,21 +191,44 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// Nothing else bounds the wait for the request: a client that connects and
+	// sends nothing held this goroutine and its socket for as long as it kept
+	// the connection open, which a scanner or a half-dead peer does for ever.
+	// Set on the socket itself, below every wrapper, and lifted by the
+	// callbacks that receive the parsed request — see clearHandshakeDeadline.
+	handshakeDeadline := time.Now().Add(cmp.Or(h.handshakeTimeout, C.TCPTimeout))
+	_ = conn.SetReadDeadline(handshakeDeadline)
+	socket := conn
 	if h.obfsMode == "http" {
 		conn = obfs.NewHTTPObfsServer(conn)
 	}
+	// A reuse session lives inside the service call below, and between two
+	// streams nothing in route tracks it: without this a reload left it open,
+	// served by the old box, and the client's next request on it failed.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	ctx = context.WithValue(ctx, (*tunnelConnKey)(nil), conn)
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
-	if err != nil {
-		N.CloseOnHandshakeFailure(conn, onClose, err)
-		if E.IsClosedOrCanceled(err) {
-			h.logger.DebugContext(ctx, "connection closed: ", err)
-		} else {
-			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
-		}
+	if err == nil {
+		return
 	}
+	if E.IsClosedOrCanceled(err) {
+		h.logger.DebugContext(ctx, "connection closed: ", err)
+	} else {
+		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		// Random bytes short of a request header (16 salt + 23 header) wait
+		// for the deadline, longer ones failed authentication at once: the
+		// difference names the protocol to a prober. Holding a failed one to
+		// the same deadline adds no reach to a client wanting to pin a
+		// connection, which fewer bytes already pin as long.
+		_ = socket.SetReadDeadline(handshakeDeadline)
+		_, _ = io.Copy(io.Discard, socket)
+	}
+	N.CloseOnHandshakeFailure(conn, onClose, err)
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	clearHandshakeDeadline(conn)
 	_, metadata := adapter.ExtendContext(ctx)
 	if source.IsValid() {
 		metadata.Source = source
@@ -209,6 +240,10 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 }
 
 func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	clearHandshakeDeadline(conn)
+	if tunnel, loaded := ctx.Value((*tunnelConnKey)(nil)).(net.Conn); loaded {
+		conn = &closeTunnelPacketConn{PacketConn: conn, tunnel: tunnel}
+	}
 	_, metadata := adapter.ExtendContext(ctx)
 	if source.IsValid() {
 		metadata.Source = source
@@ -217,6 +252,113 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		metadata.Destination = destination
 	}
 	h.newPacketConnection(ctx, conn, *metadata, onClose)
+}
+
+type tunnelConnKey struct{}
+
+// closeTunnelPacketConn ends a UDP-over-TCP session by closing its TCP
+// connection, so the client learns at once. The service's own Close keeps the
+// stream open, discarding what the client sends, until the client closes or
+// five minutes pass: after route ended the session (its UDP idle timeout, 10s
+// for port 53, the relay closing the outbound's stream, a reload) the client
+// sent into nothing meanwhile, and a DNS client waited out its own timeout
+// before it dialed again.
+type closeTunnelPacketConn struct {
+	N.PacketConn
+	tunnel net.Conn
+
+	// Packets handed over one at a time, as the copy from a naive UoT stream
+	// does, were a record and a write system call each. They are staged and
+	// written as one batch of records while the previous batch is in flight.
+	// A copy from a UDP socket reads in batches and reaches the service's
+	// batch writer through CreatePacketBatchWriter instead; a session's copy
+	// takes one path for its whole life, so the two never reorder. Packets
+	// staged but not yet written when the session closes are lost.
+	access   sync.Mutex
+	cond     sync.Cond
+	staged   []*buf.Buffer
+	dests    []M.Socksaddr
+	flushing bool
+	err      error
+	batch    N.PacketBatchWriter
+}
+
+const maxStagedPackets = 64
+
+func (c *closeTunnelPacketConn) CreatePacketBatchWriter() (N.PacketBatchWriter, bool) {
+	return bufio.CreatePacketBatchWriter(c.PacketConn)
+}
+
+func (c *closeTunnelPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.cond.L == nil {
+		c.cond.L = &c.access
+	}
+	for c.err == nil && len(c.staged) >= maxStagedPackets {
+		c.cond.Wait()
+	}
+	if c.err != nil {
+		buffer.Release()
+		return c.err
+	}
+	c.staged = append(c.staged, buffer)
+	c.dests = append(c.dests, destination)
+	if !c.flushing {
+		c.flushing = true
+		go c.flush()
+	}
+	return nil
+}
+
+func (c *closeTunnelPacketConn) flush() {
+	c.access.Lock()
+	for len(c.staged) > 0 && c.err == nil {
+		buffers, dests := c.staged, c.dests
+		c.staged, c.dests = nil, nil
+		c.cond.Broadcast()
+		c.access.Unlock()
+		var err error
+		if len(buffers) == 1 {
+			err = c.PacketConn.WritePacket(buffers[0], dests[0])
+		} else {
+			if c.batch == nil {
+				c.batch = bufio.NewPacketBatchWriter(c.PacketConn)
+			}
+			err = c.batch.WritePacketBatch(buffers, dests)
+		}
+		c.access.Lock()
+		if err != nil {
+			c.err = err
+		}
+	}
+	buf.ReleaseMulti(c.staged)
+	c.staged, c.dests = nil, nil
+	c.flushing = false
+	c.cond.Broadcast()
+	c.access.Unlock()
+}
+
+func (c *closeTunnelPacketConn) Close() error {
+	return E.Errors(c.PacketConn.Close(), c.tunnel.Close())
+}
+
+func (c *closeTunnelPacketConn) Upstream() any { return c.PacketConn }
+
+func (c *closeTunnelPacketConn) ReaderReplaceable() bool { return true }
+
+// WriterReplaceable is false so the copy cannot reach past WritePacket to the
+// service's own, which would skip the staging.
+func (c *closeTunnelPacketConn) WriterReplaceable() bool { return false }
+
+// clearHandshakeDeadline lifts the bound NewConnection put on the request, now
+// that one has been parsed. The service calls back once per logical stream,
+// so with reuse this runs again for every stream on the session — lifting a
+// bound already lifted — and the idle wait between streams stays unbounded, as
+// it was. The wrappers in between all hand deadlines to the socket. The QUIC
+// proxy's packet connections come here too and never had a deadline to lift.
+func clearHandshakeDeadline(conn interface{ SetReadDeadline(time.Time) error }) {
+	_ = conn.SetReadDeadline(time.Time{})
 }
 
 func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

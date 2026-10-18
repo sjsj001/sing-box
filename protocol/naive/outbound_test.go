@@ -4,16 +4,21 @@ package naive
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sagernet/cronet-go"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/byteformats"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/require"
@@ -29,6 +34,33 @@ func TestOutboundRejectsCertificateServerName(t *testing.T) {
 		},
 	})
 	require.ErrorContains(t, err, "certificate_server_name is not supported on naive outbound")
+}
+
+func memoryBytes(t *testing.T, value string) *byteformats.MemoryBytes {
+	var bytes byteformats.MemoryBytes
+	require.NoError(t, json.Unmarshal([]byte(value), &bytes))
+	return &bytes
+}
+
+// A value the transport would quietly turn into something else is refused. One
+// that passes goes on to fail the TLS check, as these options have no TLS.
+func TestOutboundRejectsAnOutOfRangeConcurrencyOrWindow(t *testing.T) {
+	newOutbound := func(options option.NaiveOutboundOptions) error {
+		_, err := NewOutbound(context.Background(), nil, log.NewNOPFactory().Logger(), "", options)
+		return err
+	}
+	for _, concurrency := range []int{-1, 17} {
+		require.ErrorContains(t, newOutbound(option.NaiveOutboundOptions{InsecureConcurrency: concurrency}), "insecure_concurrency must be between 0 and 16")
+	}
+	for _, concurrency := range []int{0, 16} {
+		require.ErrorIs(t, newOutbound(option.NaiveOutboundOptions{InsecureConcurrency: concurrency}), C.ErrTLSRequired)
+	}
+	require.ErrorContains(t, newOutbound(option.NaiveOutboundOptions{ReceiveWindow: memoryBytes(t, "2147483648")}), "must be under 2GiB")
+	require.ErrorContains(t, newOutbound(option.NaiveOutboundOptions{QUICSessionReceiveWindow: memoryBytes(t, "2147483648")}), "must be under 2GiB")
+	require.ErrorIs(t, newOutbound(option.NaiveOutboundOptions{
+		ReceiveWindow:            memoryBytes(t, "2147483647"),
+		QUICSessionReceiveWindow: memoryBytes(t, "2147483647"),
+	}), C.ErrTLSRequired)
 }
 
 // ackingConn is a proxy connection whose handshake has completed and whose
@@ -140,5 +172,55 @@ func TestAMeasurementNobodyIsWaitingForIsNotReported(t *testing.T) {
 			}
 			require.Never(t, written, 200*time.Millisecond, 5*time.Millisecond)
 		})
+	}
+}
+
+func TestAStreamRefusedUnprocessedIsTheHopNotTheDestination(t *testing.T) {
+	t.Parallel()
+	// A session closing for idleness refuses a stream that raced its GOAWAY.
+	// The proxy said nothing about the destination, and processed nothing.
+	refused := fmt.Errorf("stream: %w", cronet.NetErrorHTTP2ServerRefusedStream)
+	require.ErrorIs(t, localClose(refused), ErrStreamRefused, "WaitReady, which is not classified, carries it too")
+	err := classifyHandshakeError(localClose(refused))
+	require.ErrorIs(t, err, ErrStreamRefused)
+	require.ErrorIs(t, err, ErrNextHopUnreachable)
+	require.NotErrorIs(t, err, ErrDestinationUnreachable)
+	require.NotErrorIs(t, err, ErrProxyAnswered)
+}
+
+func TestAStreamThisEndAbortedIsNoReadingOfTheProxy(t *testing.T) {
+	t.Parallel()
+	// A network change: the member's CloseAllConnections fails every open
+	// stream with ERR_ABORTED, Chromium's own monitor with ERR_NETWORK_CHANGED.
+	// A probe caught on one condemned a healthy member.
+	for _, code := range []cronet.NetError{cronet.NetErrorAborted, cronet.NetErrorNetworkChanged} {
+		aborted := fmt.Errorf("stream: %w", code)
+		require.ErrorIs(t, localClose(aborted), ErrClosedLocally, "WaitReady, which is not classified, carries it too")
+		err := classifyHandshakeError(localClose(aborted))
+		require.ErrorIs(t, err, ErrClosedLocally, code)
+		require.ErrorIs(t, err, ErrNextHopUnreachable, code)
+		require.ErrorIs(t, err, code, "the trail still says which")
+		require.NotErrorIs(t, err, ErrProxyAnswered, code)
+	}
+	// The network aborting it is a reading, whatever its name shares.
+	require.NotErrorIs(t, localClose(fmt.Errorf("stream: %w", cronet.NetErrorConnectionAborted)), ErrClosedLocally)
+}
+
+func TestARejectedCredentialSaysToCheckThem(t *testing.T) {
+	t.Parallel()
+	const hint = "the proxy rejected the request: check username and password"
+	for _, test := range []struct {
+		status int
+		hinted bool
+	}{
+		{http.StatusMethodNotAllowed, true},
+		{http.StatusProxyAuthRequired, true},
+		{http.StatusForbidden, false},
+	} {
+		err := classifyHandshakeError(fmt.Errorf("handshake: %w", &cronet.HandshakeError{StatusCode: test.status}))
+		require.ErrorIs(t, err, ErrNextHopUnreachable, test.status)
+		require.ErrorIs(t, err, ErrProxyAnswered, test.status)
+		require.NotErrorIs(t, err, ErrDestinationUnreachable, test.status)
+		require.Equal(t, test.hinted, strings.Contains(err.Error(), hint), "%d: %v", test.status, err)
 	}
 }

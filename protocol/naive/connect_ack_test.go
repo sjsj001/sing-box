@@ -183,3 +183,41 @@ func TestTheDestinationLegIsTheConnectPlusFindingIt(t *testing.T) {
 	_, measured = orphan.DestinationLeg()
 	require.False(t, measured)
 }
+
+// The header is written by the previous hop, the one parser here whose bytes
+// another machine controls. Without -fuzz this runs only the seeds.
+func FuzzParseConnectAck(f *testing.F) {
+	for _, seed := range []string{
+		"", "5000", "5000;d=2000", "5000;x=1;d=2000", "200000;d=20000;n=3000",
+		"0;d=0", "0;d=0;n=0", "abc", "-1", "5000;d=-1", "5000;d=abc", ";d=1",
+		strconv.FormatInt(math.MaxInt64, 10), "5000;d=" + strconv.FormatInt(math.MaxInt64, 10),
+		"600000000;d=600000000;n=600000000", "5000;n=1", " 5000 ; d=1 ",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, value string) {
+		ack, ok := ParseConnectAck(value)
+		if !ok {
+			if ack != (ConnectAck{}) {
+				t.Fatalf("rejected %q but returned %+v", value, ack)
+			}
+			return
+		}
+		limit := time.Duration(maxAckMicros) * time.Microsecond
+		for _, d := range []time.Duration{ack.Total, ack.Connect, ack.Resolve} {
+			if d < 0 || d > limit {
+				t.Fatalf("%q: out of range %v in %+v", value, d, ack)
+			}
+		}
+		if (!ack.HasConnect && ack.Connect != 0) || (!ack.HasResolve && ack.Resolve != 0) {
+			t.Fatalf("%q: value without flag %+v", value, ack)
+		}
+		again, ok := ParseConnectAck(FormatConnectAck(ack))
+		if !ok || again != ack {
+			t.Fatalf("%q: round trip %+v -> %q -> %+v %v", value, ack, FormatConnectAck(ack), again, ok)
+		}
+		if leg, has := ack.DestinationLeg(); has && (leg < 0 || leg > 2*limit) {
+			t.Fatalf("%q: destination leg %v", value, leg)
+		}
+	})
+}

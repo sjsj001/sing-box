@@ -232,6 +232,9 @@ type naiveH2Conn struct {
 	writer        io.Writer
 	flusher       http.Flusher
 	remoteAddress net.Addr
+	// emptyReadWaits: reader is the HTTP/2 server's request body; see
+	// waitReadable.
+	emptyReadWaits bool
 	paddingConn
 	*responder
 }

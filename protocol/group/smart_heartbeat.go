@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,41 +15,36 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// warmup opens several connections to every member before serving traffic.
+// warmup reaches every member once before serving traffic, which is what
+// produces the first measurements and opens each member's first pool.
 //
-// naive spreads streams over a handful of isolated pools, so a single dial
-// leaves the rest cold — and a cold pool costs a full TLS handshake. That
-// handshake lands on whichever probe drew the cold pool, delaying its answer
-// without making its path any slower, which is exactly the way a race can reach
-// the wrong conclusion. Paying for the handshakes up front removes the
-// distortion, and removes the first real request's cold start with it.
-// It runs in two passes. The first reaches every member once, which is what
-// produces the measurements; the second fills the remaining pools, and only for
-// members that answered. Warming the pools of a member that is not there costs
-// the full cold probe budget per dial and buys nothing, and with the dials
-// bounded that wait is serial — on a start with no network it is the difference
-// between tens of seconds and minutes.
+// It used to make a second pass to open the rest of a member's pools. With
+// streams placed on the least busy pool rather than in rotation, those dials
+// landed on pools already open — an adaptive member has one at start anyway —
+// and what they did open the server closed after two idle minutes.
+//
+// It does go round again for a member whose interior is still unmeasured,
+// up to medianQuorum rounds, since that is what it takes to count. Left to
+// the heartbeat, which comes round a minute later, every relay read as
+// adjacent for the first minute or two, and UDP to a host with no TCP
+// snapshot went to the nearest leg — on a core whose legs are all loopback,
+// any group. A member the round condemned is left to its rechecks: against
+// a dead one each round costs two cold probe budgets.
 func (s *Smart) warmup(ctx context.Context) {
-	var first, rest []*smartMember
+	var members []*smartMember
 	for _, group := range s.groups {
-		for _, member := range group.members {
-			if member.outbound == nil {
-				continue
-			}
-			first = append(first, member)
+		members = append(members, group.members...)
+	}
+	for range medianQuorum {
+		s.probeMembers(ctx, members)
+		members = slices.DeleteFunc(members, func(member *smartMember) bool {
+			_, measured := member.chain()
+			return measured || !member.healthy.Load()
+		})
+		if len(members) == 0 || ctx.Err() != nil {
+			return
 		}
 	}
-	s.probeMembers(ctx, first)
-
-	for _, member := range first {
-		if !member.healthy.Load() {
-			continue
-		}
-		for range member.warmupDials() - 1 {
-			rest = append(rest, member)
-		}
-	}
-	s.probeMembers(ctx, rest)
 }
 
 // probeMembers dials the given members, a few at a time.
@@ -64,13 +61,35 @@ func (s *Smart) probeMembers(ctx context.Context, members []*smartMember) {
 // probeTarget is what a routine heartbeat has to reach, from what this member
 // has been measured to be.
 //
+// The default is the proxy's own probe address, which it answers itself
+// without dialing: nothing leaves the proxy, so an idle member can be kept warm
+// and measured as often as we like without being visible to anyone downstream,
+// and the round trip that comes back is purely the leg to the proxy — which is
+// what makes it a clean measurement of that leg.
+//
 // A member with no interior has nothing a real address could tell us that the
 // proxy's own cannot, so it keeps that one and keeps emitting nothing. A
 // member with an interior has two things only a real dial can settle: what
 // that interior currently costs, and whether it is there at all — a relay
 // whose own upstream has died answers the proxy address perfectly, every time.
+//
+// Two more cases need the real address for the same reason. A member that
+// refused real traffic since its last heartbeat may have lost its egress, and
+// a member that is down must not be let back in by the probe address — which
+// is what an interface change used to do, probing every member this way.
+//
+// So does a member whose interior has not been measured yet, which is every
+// member after a start: the chain window lives in memory only. Unmeasured, a
+// relay reads as adjacent, and on a core whose members all dial a leg on
+// loopback that sent the fallback and UDP with no snapshot to the furthest
+// group until it had won three races. Three rounds settle it, and warmup runs
+// all three; a member found to have no interior then goes back to the probe
+// address.
 func probeTarget(member *smartMember) M.Socksaddr {
-	if member.relayed() {
+	if member.relayed() || member.refused.Swap(false) || !member.healthy.Load() {
+		return reachabilityDestinations[0]
+	}
+	if _, measured := member.chain(); !measured {
 		return reachabilityDestinations[0]
 	}
 	return naive.ProbeDestination()
@@ -82,30 +101,19 @@ func (s *Smart) confirmMembers(ctx context.Context, members []*smartMember) {
 	s.probeEach(ctx, members, proveReachable)
 }
 
-// keepWarm and proveReachable are what a probe has to reach, and the choice
-// says what the probe is for.
-//
-// keepWarm asks the proxy's own probe address, which it answers itself without
-// dialing: nothing leaves the proxy, so an idle member can be kept warm and
-// measured as often as we like without being visible to anyone downstream, and
-// the round trip that comes back is purely the leg to the proxy — which is what
-// makes it a clean measurement of that leg.
-//
-// proveReachable asks for somewhere real, because there is a failure the first
-// question cannot see. A proxy whose own upstream is broken still answers its
-// probe address perfectly — it never dials for it — so it stays healthy through
-// a heartbeat while refusing every destination anyone actually wants. Measured
-// on a relay whose next hop had stalled: real traffic failing in the same
-// second as a heartbeat coming back in 128ms, over and over, with the member
-// never once condemned.
+// proveReachable asks for somewhere real, because there is a failure the
+// proxy's own probe address cannot see. A proxy whose own upstream is broken
+// still answers that address perfectly — it never dials for it — so it stays
+// healthy through a heartbeat while refusing every destination anyone actually
+// wants. Measured on a relay whose next hop had stalled: real traffic failing
+// in the same second as a heartbeat coming back in 128ms, over and over, with
+// the member never once condemned.
 //
 // The address is an IP literal so a broken resolver at the proxy cannot answer
 // the question the wrong way, and anycast so it is near wherever the exit is.
 // Reaching it is not proof that everything works, and it does not need to be:
 // this only ever runs alongside a real failure that already happened, so it is
 // a second, independent reading rather than a lone canary.
-func keepWarm(*smartMember) M.Socksaddr { return naive.ProbeDestination() }
-
 func proveReachable(*smartMember) M.Socksaddr { return reachabilityDestinations[0] }
 
 // reachabilityDestinations are what a probe dials when the question needs the
@@ -172,6 +180,11 @@ func (s *Smart) probeEach(ctx context.Context, members []*smartMember, destinati
 			// Released only on the path that took a slot; the branch above
 			// returns before this is registered.
 			defer func() { <-slots }()
+			if ctx.Err() != nil {
+				// A free slot and a cancelled round can be ready together, and
+				// select picks between them at random.
+				return
+			}
 			s.probeMember(ctx, member, destination(member))
 		}(member)
 	}
@@ -239,8 +252,8 @@ func nextHeartbeat() time.Duration {
 
 // heartbeatRound pings the members that need it.
 //
-// A member that carried real traffic within the interval is skipped: it has just
-// proved both things a heartbeat checks. What is left is the idle members — and
+// A member that carried real traffic within heartbeatSkipWindow is skipped: it
+// has just proved both things a heartbeat checks. What is left is the idle members — and
 // those are exactly the ones a failover will reach for, and the ones whose
 // connection pool would otherwise have gone cold. The traffic therefore scales
 // with idleness, not with the size of the configuration.
@@ -285,10 +298,10 @@ func split(members []*smartMember, yes func(*smartMember) bool) (matched, rest [
 }
 
 // dueForHeartbeat is who a round would probe: every member that has not carried
-// traffic within the interval, plus every member currently marked down — for
-// those the heartbeat is the only thing that can discover they came back.
+// traffic within heartbeatSkipWindow, plus every member currently marked down —
+// for those the heartbeat is the only thing that can discover they came back.
 func (s *Smart) dueForHeartbeat(now time.Time) []*smartMember {
-	deadline := now.Add(-heartbeatInterval).UnixNano()
+	deadline := now.Add(-heartbeatSkipWindow).UnixNano()
 	var due []*smartMember
 	for _, group := range s.groups {
 		for _, member := range group.members {
@@ -305,20 +318,52 @@ func (s *Smart) dueForHeartbeat(now time.Time) []*smartMember {
 }
 
 // probeMember measures one member against the address the caller chose, and
-// settles its health on the answer — see keepWarm and proveReachable for what
+// settles its health on the answer — see probeTarget and proveReachable for what
 // the choice decides.
 func (s *Smart) probeMember(ctx context.Context, member *smartMember, destination M.Socksaddr) {
+	if err := s.probeVerdict(ctx, member, destination, 0); err != nil {
+		s.markDown(member, err)
+	}
+}
+
+// probeVerdict is the failure a probe of member ends in, nil when the member
+// answered. Each dial gets budget, or one derived from the member when that is
+// zero; see probeOnce.
+func (s *Smart) probeVerdict(ctx context.Context, member *smartMember, destination M.Socksaddr, budget time.Duration) error {
 	if member.outbound == nil {
-		return
+		return nil
 	}
-	err := s.probeOnce(ctx, member, destination)
+	err := s.probeOnce(ctx, member, destination, budget)
+	if errors.Is(err, net.ErrClosed) && ctx.Err() == nil {
+		// The session the probe was on went away under it. On a network
+		// change the member drops its own sessions just after this round
+		// starts whenever this group comes first in the configuration, and
+		// the streams in flight get one of two answers: ERR_ABORTED, which is
+		// naive.ErrClosedLocally, or ERR_CONNECTION_CLOSED for a stream placed
+		// on a session already draining — three to five of eight resets
+		// condemned a healthy member that way. The second is also what a
+		// server's FIN reads as, so it is not excused, only tried again: the
+		// attempt lands on a fresh session, and its outcome is judged below
+		// like any other. net.ErrClosed is what every "session gone" answer
+		// matches, ErrClosedLocally included; a refusal or a timeout does not,
+		// so a node that is dead is not dialed twice for it.
+		err = s.probeOnce(ctx, member, destination, budget)
+	}
 	if err == nil {
-		return
+		return nil
 	}
-	if errors.Is(err, context.Canceled) {
-		// Shutting down. Not a reading about anything, and no reason to spend a
-		// second dial establishing that.
-		return
+	if errors.Is(err, context.Canceled) || errors.Is(err, naive.ErrClosedLocally) {
+		// Shutting down, or the round was called off by an interface change,
+		// or the tunnel was closed from this side again — see above.
+		// Not a reading about anything, and no reason to spend a second dial
+		// establishing that. A real address may have been asked because the
+		// member refused traffic, and probeTarget consumed that evidence: put
+		// it back, or a burst of interface changes erases it and the member
+		// must refuse again before anything checks its egress.
+		if _, real := alternateReachability(destination); real {
+			member.refused.Store(true)
+		}
+		return err
 	}
 	if errors.Is(err, naive.ErrNextHopUnreachable) && errors.Is(err, naive.ErrProxyAnswered) {
 		// The proxy answered, and what it said was that its own next hop is
@@ -332,36 +377,44 @@ func (s *Smart) probeMember(ctx context.Context, member *smartMember, destinatio
 		// having spoken — and a blackholed address is precisely the case the
 		// cross-check below exists for, and precisely the one that repeats
 		// every round.
-		s.markDown(member, err)
-		return
+		return err
 	}
 	alternate, hasAlternate := alternateReachability(destination)
 	if !hasAlternate {
-		s.markDown(member, err)
-		return
+		return err
 	}
 	// Everything else is ambiguous from here: a refusal, a timeout and a
 	// blackhole look the same whether the exit cannot reach anything or cannot
 	// reach this one address. Asking a second, independent one is what tells
 	// them apart, and it only costs a dial in the case that was already a
 	// failure.
-	if second := s.probeOnce(ctx, member, alternate); second != nil {
-		s.markDown(member, second)
-		return
+	if second := s.probeOnce(ctx, member, alternate, budget); second != nil {
+		if errors.Is(second, context.Canceled) || errors.Is(second, naive.ErrClosedLocally) {
+			// Called off before the second opinion came in; keep the
+			// evidence that sent this probe to real addresses, as above.
+			member.refused.Store(true)
+		}
+		return second
 	}
 	s.logger.Debug("member ", member.tag, " could not reach ", destination,
 		" but reached ", alternate, ": ", err)
+	return nil
 }
 
 // probeOnce measures one member against one address, banking what comes back.
-func (s *Smart) probeOnce(ctx context.Context, member *smartMember, destination M.Socksaddr) error {
-	// Derived from the member's own latency: a fixed budget either starves the
-	// distant nodes, whose cold handshake alone can exceed it, or waits far too
-	// long on the near ones.
-	probeCtx, cancel := context.WithTimeout(ctx, s.probeTimeout(member, destination))
+//
+// The budget is derived from the member's own latency unless the caller gives
+// one: a fixed budget either starves the distant nodes, whose cold handshake
+// alone can exceed it, or waits far too long on the near ones.
+func (s *Smart) probeOnce(ctx context.Context, member *smartMember, destination M.Socksaddr, budget time.Duration) error {
+	derived := budget == 0
+	if derived {
+		budget = s.probeTimeout(member, destination)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	conn, err := member.outbound.DialContext(probeCtx, N.NetworkTCP, destination)
+	conn, err := member.outbound.DialContext(naive.WithProbe(probeCtx), N.NetworkTCP, destination)
 	if err != nil {
 		return err
 	}
@@ -387,8 +440,11 @@ func (s *Smart) probeOnce(ctx context.Context, member *smartMember, destination 
 				" does not report connect timings; the server does not support the smart extension")
 		})
 	}
-	if !member.healthy.Load() {
-		s.logger.Info("member ", member.tag, " is reachable again")
+	if !derived {
+		// Given long enough to wait out a queue, so what it timed is the
+		// queue: banked, ten seconds of it would sit in the chain window as
+		// distance, and the window drops only its worst sample of eight.
+		return nil
 	}
 	s.recordProbe(member, destination, measurement)
 	return nil
@@ -425,13 +481,7 @@ func (s *Smart) probeTimeout(member *smartMember, destination M.Socksaddr) time.
 }
 
 func (s *Smart) markDown(member *smartMember, err error) {
-	if errors.Is(err, context.Canceled) || errors.Is(err, naive.ErrClosedLocally) {
-		// Nobody was waiting for the answer, by the two routes that produce
-		// that: the probe was called off, or its tunnel was closed from this
-		// side. Neither is a reading of the member. This is the second of the
-		// two doors a condemnation comes through — reportFailure is the other,
-		// and it has to draw the same line or the one that does not becomes
-		// the way a healthy node still gets taken out of service.
+	if calledOff(err) {
 		return
 	}
 	// A refusal about one address is deliberately *not* filtered out here.
@@ -442,7 +492,139 @@ func (s *Smart) markDown(member *smartMember, err error) {
 	// refusal is cannot be told from the refusal — it is told by asking a second
 	// independent address, which probeMember has already done by the time
 	// anything reaches here. See reachabilityDestinations.
-	if member.healthy.CompareAndSwap(true, false) {
-		s.logger.Warn("member ", member.tag, " is unreachable: ", err)
+	if s.congested(member, err) {
+		return
 	}
+	s.condemn(member, err)
+}
+
+// calledOff reports a probe failure that is no reading of the member.
+//
+// Nobody was waiting for the answer, by the two routes that produce that: the
+// probe was called off, or its tunnel was closed from this side. markDown is
+// the second of the two doors a condemnation comes through — reportFailure is
+// the other, and it has to draw the same line or the one that does not becomes
+// the way a healthy node still gets taken out of service.
+//
+// Nor is a stream the proxy refused unprocessed: its session was closing for
+// idleness as the probe arrived, which an idle member's heartbeat lands on now
+// and then. The next round measures it again.
+func calledOff(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, naive.ErrClosedLocally) || errors.Is(err, naive.ErrStreamRefused)
+}
+
+// congested reports — and says, once per episode — that a probe went
+// unanswered on a member that is still delivering, which is a member too busy
+// to answer in time rather than a dead one.
+//
+// Seen in production: one large download saturated the path through a
+// group's only member, new streams on it waited thirty seconds for an answer,
+// and the confirming probe ran out of its two-second budget. The member was
+// condemned, the download moved to the next group and saturated that one, and
+// then the next — three countries taken out one after another by a node that
+// had been delivering the whole time. Moving the load cures nothing there: the
+// queue is on whatever path carries it.
+//
+// Only silence is excused: the probe's own budget running out, or the bound on
+// establishing the leg. A proxy that answered — refused, 502, 503 — or a leg
+// that broke said something about the member, and is judged as before. And
+// only for congestionGrace after the last payload arrived: a member that has
+// really died stops delivering too, and the first probe after that condemns
+// it. Nor for ever while it keeps delivering: each episode starts one probe
+// that is given as long as a connection would wait, see outwait.
+func (s *Smart) congested(member *smartMember, err error) bool {
+	if !member.healthy.Load() || !unanswered(err) || !member.delivering(time.Now()) {
+		return false
+	}
+	if member.congested.CompareAndSwap(false, true) {
+		s.logger.Info("member ", member.tag, " is congested, not condemning: ", err)
+		s.auditHealth(member, "congested", err)
+	}
+	// Every excuse, not only an episode's first: a long probe that was called
+	// off ended without a verdict and left the episode open, and nothing else
+	// would start another. outwaiting keeps it to one in flight.
+	s.outwait(member)
+	return true
+}
+
+// outwait bounds the congestion excuse: one probe per episode, given
+// settleTimeout per address — what a connection waits for its CONNECT to be
+// answered — and condemning the member if it still hears nothing.
+//
+// The excuse alone had no end. A member whose old streams keep delivering
+// while its new ones are never answered — an exit whose connection table is
+// full, a provider dropping new SYNs — was excused on every probe for as long
+// as one download lasted, and every new connection on it waited out the whole
+// settle. Real bottleneck queues measured one to fifteen seconds; a member
+// that answers nothing in thirty has already failed every connection placed
+// on it in that time.
+//
+// Its failures go straight to condemn rather than through markDown, whose
+// excuse is for a probe that ran out of a budget shorter than the queue. This
+// one has outwaited any queue, so silence now is not congestion; and it went
+// through probeVerdict, so the second address was asked with the same time to
+// answer, and an exit that drops one of them is not condemned for it. A late
+// answer ends the episode without being banked; see probeOnce. Nothing is done
+// when the member has been condemned since it began, or condemned and let back
+// in: what it heard is older than that verdict.
+//
+// recordProbe and a late answer both end an episode, so a download that keeps
+// the path full starts one of these each time a probe is excused again.
+func (s *Smart) outwait(member *smartMember) {
+	if member.outbound == nil || !member.outwaiting.CompareAndSwap(false, true) {
+		return
+	}
+	downAt := member.downAt.Load()
+	go func() {
+		defer member.outwaiting.Store(false)
+		err := s.probeVerdict(s.ctx, member, reachabilityDestinations[0], settleTimeout)
+		// An answer heard meanwhile ended the episode; what this probe heard is
+		// older than it.
+		if s.closed.Load() || !member.healthy.Load() || member.downAt.Load() != downAt || !member.congested.Load() {
+			return
+		}
+		if err == nil {
+			member.congested.Store(false)
+			return
+		}
+		if !calledOff(err) {
+			s.condemn(member, err)
+		}
+	}()
+}
+
+// unanswered reports a failure that is silence: a deadline ran out with no
+// status from the proxy. Both shapes it arrives in wrap context.DeadlineExceeded
+// — a probe's budget expiring inside Measure, and errLegTimedOut — and neither
+// carries ErrProxyAnswered, which every status does.
+func unanswered(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, naive.ErrProxyAnswered)
+}
+
+// condemn takes a member out of service. markDown and reportFailure both come
+// here, so a condemnation is recorded the same way whichever door it came
+// through — including for the flap hold, which needs every one of them.
+func (s *Smart) condemn(member *smartMember, err error) {
+	if !member.healthy.CompareAndSwap(true, false) {
+		return
+	}
+	member.previousDownAt.Store(member.downAt.Load())
+	downAt := time.Now().UnixNano()
+	member.downAt.Store(downAt)
+	member.congested.Store(false)
+	if s.ctx.Err() == nil && !s.closed.Load() {
+		s.scheduleRechecks(member)
+	}
+	if member.heldDown(time.Unix(0, downAt), s.flapHold()) {
+		// The rechecks inside the hold are skipped by it; this is the one at
+		// its end.
+		time.AfterFunc(s.flapHold(), func() {
+			if !s.closed.Load() && !member.healthy.Load() && member.downAt.Load() == downAt {
+				s.confirmDown(member)
+			}
+		})
+	}
+	member.udp.Interrupt(true)
+	s.logger.Warn("member ", member.tag, " is unreachable: ", err)
+	s.auditHealth(member, "down", err)
 }

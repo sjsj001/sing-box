@@ -1,6 +1,7 @@
 package group
 
 import (
+	"slices"
 	"time"
 )
 
@@ -132,6 +133,12 @@ const (
 // keeps its place unless a challenger beats it by more than switchHysteresis.
 // Groups without a measurement for this destination are not selectable — there
 // is nothing to rank them by — and an empty result means the caller must race.
+//
+// Nor, behind relays, is a challenger whose interior nothing has crossed: it
+// reads as adjacent (see fallbackGroup), and after a restart, while the chain
+// windows fill, it took cached destinations off the groups already measured,
+// moving them to a further exit and back once its chain came in. It keeps a
+// place it holds.
 func selectGroup(alpha float64, candidates []candidate, incumbent string) (string, string) {
 	var (
 		best           string
@@ -139,8 +146,12 @@ func selectGroup(alpha float64, candidates []candidate, incumbent string) (strin
 		incumbentScore time.Duration
 		hasIncumbent   bool
 	)
+	relays := slices.ContainsFunc(candidates, func(c candidate) bool { return c.hasChain && c.chain >= chainProbeFloor })
 	for _, candidate := range candidates {
 		if !candidate.hasRemote || !candidate.hasLocal {
+			continue
+		}
+		if relays && !candidate.hasChain && candidate.tag != incumbent {
 			continue
 		}
 		candidateScore := candidate.score(alpha)
@@ -163,9 +174,15 @@ func selectGroup(alpha float64, candidates []candidate, incumbent string) (strin
 // destination, and it is also the order a race should be read in.
 func fallbackGroup(alpha float64, candidates []candidate) string {
 	var (
-		best      string
-		bestBound time.Duration
+		best           string
+		bestBound      time.Duration
+		bestUnmeasured bool
 	)
+	// Behind a relay the distance lives in the chain, and a member nothing has
+	// crossed yet reads as adjacent: after a restart that sent the static
+	// choice to the furthest group. Once any candidate is known to sit behind
+	// a relay, the ones whose interior is unmeasured rank after the rest.
+	relays := slices.ContainsFunc(candidates, func(c candidate) bool { return c.hasChain && c.chain >= chainProbeFloor })
 	for _, candidate := range candidates {
 		if !candidate.hasLocal {
 			// Its static bound would be just -bonus, which would rank a group
@@ -173,8 +190,9 @@ func fallbackGroup(alpha float64, candidates []candidate) string {
 			continue
 		}
 		bound := candidate.staticBound(alpha)
-		if best == "" || bound < bestBound {
-			best, bestBound = candidate.tag, bound
+		unmeasured := relays && !candidate.hasChain
+		if best == "" || bestUnmeasured && !unmeasured || bestUnmeasured == unmeasured && bound < bestBound {
+			best, bestBound, bestUnmeasured = candidate.tag, bound, unmeasured
 		}
 	}
 	if best == "" && len(candidates) > 0 {
@@ -294,14 +312,16 @@ func (r *race) viable() []candidate {
 // known its remote exceeds T-local and its score exceeds
 // alpha*local + (T - local) - bonus. It can therefore still win only while
 //
-//	T < best + bonus + local*(1-alpha)
+//	T < best + bonus + local*(1-alpha) + setupAllowance
 //
-// which is tight under its model — an answer arriving at local + remote — and
-// grows with bonus, so a node declared worth waiting for is waited for exactly
-// as much longer as that declaration says. What the model leaves out is that
-// an answer actually arrives at local + span, DNS included; the race's
-// background half covers that gap, at no cost to the caller waiting here. See
-// Smart.collectStragglers.
+// where setupAllowance hands back the handshake a pool gone cold adds without
+// its path being any slower. The bound is tight under its model — an answer
+// arriving at local + remote — and grows with bonus, so a node declared worth
+// waiting for is waited for exactly as much longer as that declaration says.
+// What the model leaves out is an interior running over its banked local, and
+// a round's remote carrying a cold lookup the next connection will not pay;
+// the race's background half covers that gap, at no cost to the caller
+// waiting here. See Smart.collectStragglers.
 // firstAnswerAt is when the answer now in hand arrived, measured from the start
 // of the race. The cap is applied from there rather than from the start because
 // it bounds chasing a *better* answer, and there is nothing to chase until one

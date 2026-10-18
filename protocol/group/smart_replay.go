@@ -1,15 +1,22 @@
 package group
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"io"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 // A connection handed to the caller before the proxy has said whether it could
@@ -48,12 +55,18 @@ type replayConn struct {
 	key         string
 	group       *smartGroup
 	member      *smartMember
-	exclude     map[string]bool
+	// exclude is every group this connection has been dialed on, or nil for a
+	// first dial, which has been dialed on its own group only.
+	exclude map[string]bool
 
-	access   sync.Mutex
-	settled  bool
-	replay   []byte
-	replayOK bool
+	access  sync.Mutex
+	settled bool
+	replay  []byte
+	// overflowed is sticky. Once more has been written than the buffer holds,
+	// the buffer is no longer the whole of what was said, and a later write
+	// that happens to fit must not make it look replayable again — replaying
+	// it would deliver the opening with a hole in it.
+	overflowed bool
 	// failingOver is set once the tunnel has been condemned and before the
 	// replacement is dialed. While it is set the buffer belongs to the settler:
 	// a write arriving in that window must join the replay rather than go onto a
@@ -77,16 +90,14 @@ type replayConn struct {
 	settleErr  error
 }
 
-// bufferReplay copies p aside for a possible replay, reporting whether the
-// connection is still replayable at all. The lock must be held.
+// bufferReplay copies p aside for a possible replay. The lock must be held.
 func (c *replayConn) bufferReplay(p []byte) {
-	if len(c.replay)+len(p) <= replayBufferLimit {
-		c.replay = append(c.replay, p...)
-		c.replayOK = true
+	if c.overflowed || len(c.replay)+len(p) > replayBufferLimit {
+		// Too much has been said to repeat it; the connection is committed.
+		c.overflowed, c.replay = true, nil
 		return
 	}
-	// Too much has been said to repeat it; the connection is committed.
-	c.replayOK = false
+	c.replay = append(c.replay, p...)
 }
 
 func (c *replayConn) Write(p []byte) (int, error) {
@@ -137,7 +148,68 @@ func (c *replayConn) Read(p []byte) (int, error) {
 	c.access.Lock()
 	conn := c.Conn
 	c.access.Unlock()
-	return conn.Read(p)
+	n, err := conn.Read(p)
+	if n > 0 {
+		// Payload arriving is the one thing a congested member and a dead
+		// one do not share; see Smart.congested. After a failover the tunnel
+		// read is the replacement, itself a replayConn, which stamps the
+		// member it was dialed through — stamping c.member here as well would
+		// credit the member this connection just left.
+		if _, replaced := conn.(*replayConn); !replaced {
+			c.member.noteDelivered()
+		}
+	}
+	return n, err
+}
+
+// idleReadBuffer is the pool tier a download waits on while its tunnel is
+// quiet. The copy loop otherwise takes its full buffer, 32 KiB for a snell
+// client, before it blocks in Read, and a cronet tunnel is no file descriptor
+// it could wait on without one: every idle connection held that buffer for as
+// long as it stayed idle. 16 KiB still takes a 16383-byte snell record in one
+// read; at 4 KiB the core spent 14% more CPU on mid-sized responses (B25).
+const idleReadBuffer = 16 * 1024
+
+// CreateReadWaiter lets the copy loop wait on a small buffer. Reads still go
+// through Read, so settling and the delivery stamp are unchanged.
+func (c *replayConn) CreateReadWaiter() (N.ReadWaiter, bool) {
+	return &replayReadWaiter{conn: c}, true
+}
+
+type replayReadWaiter struct {
+	conn    io.Reader
+	options N.ReadWaitOptions
+	// full records that the last read filled its buffer: a burst is under way,
+	// and the next read takes the full size again.
+	full bool
+}
+
+func (w *replayReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	w.options = options
+	return false
+}
+
+func (w *replayReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
+	for {
+		var buffer *buf.Buffer
+		if w.full {
+			buffer = w.options.NewBuffer()
+		} else {
+			buffer = w.options.NewBufferSize(max(idleReadBuffer-w.options.FrontHeadroom-w.options.RearHeadroom, 1024))
+		}
+		free := buffer.FreeBytes()
+		n, err := w.conn.Read(free)
+		w.full = n == len(free)
+		if n > 0 && (err == nil || errors.Is(err, io.EOF)) {
+			buffer.Truncate(n)
+			w.options.PostReturn(buffer)
+			return buffer, nil
+		}
+		buffer.Release()
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // settle waits for the proxy's answer and, if it refused, moves the connection
@@ -170,11 +242,18 @@ func (c *replayConn) doSettle() error {
 	ctx, cancel := c.settleContext()
 	defer cancel()
 
+	// A proxy that has silently stopped answering leaves this wait to run
+	// into the settle timeout, and every new connection to the member does the
+	// same until something checks it. The connection's own wait is left
+	// exactly as it is — a slow destination is still a working one — and the
+	// member is checked beside it; see Smart.suspect.
+	suspicion := time.AfterFunc(cmp.Or(c.smart.suspectAfter, settleSuspicion), func() { c.smart.suspect(member) })
 	err := c.smart.awaitReady(ctx, member, conn)
 	var measurement naive.ConnMeasurement
 	if err == nil {
 		measurement, err = measured.Measure(ctx)
 	}
+	suspicion.Stop()
 	if err == nil {
 		c.smart.record(member, measurement)
 		if measurement.HasRemote {
@@ -197,9 +276,15 @@ func (c *replayConn) doSettle() error {
 	conn.Close()
 
 	c.access.Lock()
-	replayable := (c.replayOK || len(c.replay) == 0) && !c.closed
+	replayable := !c.overflowed && !c.closed
+	// A ClientHello with no early data asks for nothing but a handshake and
+	// may reach the destination twice (see classifyHello), so it needs no
+	// proof that it went nowhere. Judged on the buffer as the closed tunnel
+	// left it: a write joining it later failed on that tunnel.
+	n, verdict := classifyHello(c.replay)
+	onlyHello := verdict == helloCarriable && n == len(c.replay)
 	c.access.Unlock()
-	replayable = replayable && definiteFailure(err) && provenUndelivered(err, conn)
+	replayable = replayable && definiteFailure(err) && (onlyHello || provenUndelivered(err, conn))
 
 	c.access.Lock()
 	if c.closed {
@@ -220,18 +305,23 @@ func (c *replayConn) doSettle() error {
 	for tag := range c.exclude {
 		exclude = append(exclude, tag)
 	}
-	replacement, dialErr := c.smart.replayOnAnotherGroup(ctx, c.destination, c.key, exclude...)
+	if c.exclude == nil {
+		exclude = []string{c.group.tag}
+	}
+	slices.Sort(exclude)
+	replacement, dialErr := c.smart.replayOnAnotherGroup(ctx, c.destination, c.key, c.group.tag, err, exclude...)
 	if dialErr != nil {
 		c.finish()
-		return err
+		// Every replacement refused too. The error is the last group's, and
+		// without the list it reads as that group alone having failed.
+		return E.Cause(err, "tried ", strings.Join(exclude, ","))
 	}
 
-	// The buffer is captured under the same lock that installs the replacement,
-	// and only now — capturing it before the dial would drop every write that
+	// The buffer is taken under the same lock that installs the replacement,
+	// and only now — taking it before the dial would drop every write that
 	// arrived while it was in progress, having already reported them as sent.
 	c.access.Lock()
-	buffered, closed, canReplay := c.replay, c.closed, c.replayOK || len(c.replay) == 0
-	if closed || !canReplay {
+	if c.closed || c.overflowed {
 		// Either the caller gave up while the replacement was being dialed, or
 		// the writes that arrived in that window pushed the buffer past what can
 		// be repeated. Nothing may be handed back a connection it cannot use.
@@ -249,16 +339,28 @@ func (c *replayConn) doSettle() error {
 			_ = replacement.SetDeadline(c.deadline)
 		}
 	}
-	if len(buffered) > 0 {
-		if _, writeErr := replacement.Write(buffered); writeErr != nil {
+	// Installed before the flush, and the flush runs unlocked. A write onto a
+	// leg that is still coming up takes as long as the leg does, and with the
+	// lock held through it Close, the deadlines and every write waited too —
+	// for minutes when the replacement could not connect either. Installed
+	// first, Close reaches the replacement and the stuck write returns.
+	// failingOver stays set, so writes arriving meanwhile still join the
+	// buffer, and the loop sends them after what is already on its way.
+	c.Conn = replacement
+	for len(c.replay) > 0 {
+		buffered := c.replay
+		c.replay = nil
+		c.access.Unlock()
+		_, writeErr := replacement.Write(buffered)
+		c.access.Lock()
+		if writeErr != nil || c.closed || c.overflowed {
 			c.settled, c.failingOver, c.replay = true, false, nil
 			c.access.Unlock()
 			replacement.Close()
 			return err
 		}
 	}
-	c.Conn = replacement
-	c.settled, c.failingOver, c.replay = true, false, nil
+	c.settled, c.failingOver = true, false
 	c.access.Unlock()
 	// The condemned tunnel was closed before it was judged, above.
 	return nil
@@ -322,6 +424,23 @@ func (c *replayConn) current() net.Conn {
 func (c *replayConn) SetWriteDeadline(t time.Time) error { return c.current().SetWriteDeadline(t) }
 func (c *replayConn) LocalAddr() net.Addr                { return c.current().LocalAddr() }
 func (c *replayConn) RemoteAddr() net.Addr               { return c.current().RemoteAddr() }
+
+// CloseWrite half-closes the tunnel the caller ends up holding, which only
+// settling decides. Before it, the end of the request could land on a tunnel
+// about to be condemned, and a failover would replay the opening onto a
+// replacement whose request stream never ends. Waiting also orders it after
+// writes still joining the replay. A tunnel that cannot half-close reports an
+// error, which the copy loop answers by closing it outright.
+func (c *replayConn) CloseWrite() error {
+	if err := c.settle(); err != nil {
+		return err
+	}
+	closer, isCloser := c.current().(N.WriteCloser)
+	if !isCloser {
+		return errors.ErrUnsupported
+	}
+	return closer.CloseWrite()
+}
 
 // RemoteAck reports what the proxy answered, for a relay whose outbound is this
 // smart group: without it the relay cannot pass the innermost connect time
@@ -390,7 +509,7 @@ func definiteFailure(err error) bool {
 // answered 502 for an error it merely failed to classify would be handing out
 // replay licences for payload still sitting on one of its own legs.
 func provenUndelivered(err error, conn net.Conn) bool {
-	if errors.Is(err, naive.ErrDestinationUnreachable) {
+	if errors.Is(err, naive.ErrDestinationUnreachable) || errors.Is(err, naive.ErrStreamRefused) {
 		return true
 	}
 	if carrier, isCarrier := common.Cast[naive.PayloadCarrier](conn); isCarrier {

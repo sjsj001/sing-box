@@ -2,8 +2,10 @@ package group
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +42,9 @@ type resolvingOutbound struct {
 	// coldDelay holds the first answer back, which is how a test reaches the
 	// half of a race that runs after the caller has left with its tunnel.
 	coldDelay time.Duration
+	// warmGate, when set, holds every dial after the first until it is closed,
+	// which is how a test reads the race's own reading before the retake lands.
+	warmGate chan struct{}
 
 	access sync.Mutex
 	dialed []M.Socksaddr
@@ -47,13 +52,20 @@ type resolvingOutbound struct {
 
 func (o *resolvingOutbound) Network() []string { return []string{N.NetworkTCP} }
 
-func (o *resolvingOutbound) DialContext(_ context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
+func (o *resolvingOutbound) DialContext(ctx context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
 	o.access.Lock()
 	o.dialed = append(o.dialed, destination)
 	nth := len(o.dialed)
 	o.access.Unlock()
 	if nth == 1 {
 		return &answeringConn{delay: o.coldDelay, measurement: o.cold}, nil
+	}
+	if o.warmGate != nil {
+		select {
+		case <-o.warmGate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	if o.failWarm {
 		return nil, E.Cause(naive.ErrNextHopUnreachable, "the retake did not get through")
@@ -75,10 +87,11 @@ func newWarmFixture(t *testing.T, outs map[string]*resolvingOutbound) *Smart {
 func newWarmFixtureOn(t *testing.T, cache *smartCache, outs map[string]*resolvingOutbound) *Smart {
 	t.Helper()
 	smart := &Smart{
-		ctx:    context.Background(),
-		logger: logger.NOP(),
-		alpha:  testAlpha,
-		cache:  cache,
+		ctx:                 context.Background(),
+		logger:              logger.NOP(),
+		alpha:               testAlpha,
+		cache:               cache,
+		raceIgnoresDeadline: true,
 	}
 	for _, tag := range []string{"a", "b"} {
 		out, configured := outs[tag]
@@ -106,11 +119,20 @@ func warmSibling() *resolvingOutbound {
 
 func remoteOf(t *testing.T, smart *Smart, key string, tag string) time.Duration {
 	t.Helper()
-	entry := smart.cache.load(key)
-	require.NotNil(t, entry)
-	value, measured := entry.remoteFor(tag)
+	value, measured := remoteReading(smart, key, tag)
 	require.True(t, measured)
 	return value
+}
+
+// remoteReading is remoteOf without the assertions, for a condition polled by
+// Eventually: that runs on another goroutine, where a failed require marks the
+// test failed without stopping the poll.
+func remoteReading(smart *Smart, key string, tag string) (time.Duration, bool) {
+	entry := smart.cache.load(key)
+	if entry == nil {
+		return 0, false
+	}
+	return entry.remoteFor(tag)
 }
 
 func TestAChallengerIsNotJudgedOnItsExitsColdResolver(t *testing.T) {
@@ -126,17 +148,23 @@ func TestAChallengerIsNotJudgedOnItsExitsColdResolver(t *testing.T) {
 		cold: resolved(ms(20), ms(30), 0),
 		warm: resolved(ms(20), ms(30), 0),
 	}
+	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
 	challenger := &resolvingOutbound{
 		// Genuinely nearer the destination, and it looks slower only because
 		// its exit had to find it.
 		cold: resolved(ms(20), ms(5), ms(50)),
 		warm: resolved(ms(20), ms(5), 0),
+		// The retake starts the moment the race is done and answers at once,
+		// so it is held until the race's own reading has been read.
+		warmGate: gate,
 	}
 	smart := newWarmFixture(t, map[string]*resolvingOutbound{"a": incumbent, "b": challenger})
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
@@ -146,8 +174,10 @@ func TestAChallengerIsNotJudgedOnItsExitsColdResolver(t *testing.T) {
 	require.Equal(t, ms(55), remoteOf(t, smart, key, "b"),
 		"the round's own verdict stands on the numbers the round had")
 
+	release()
 	require.Eventually(t, func() bool {
-		return remoteOf(t, smart, key, "b") == ms(5)
+		value, _ := remoteReading(smart, key, "b")
+		return value == ms(5)
 	}, time.Second, time.Millisecond,
 		"the reading the next thousand connections are routed on must be the one taken warm")
 
@@ -171,7 +201,7 @@ func TestARetakeThatFailsLeavesTheReadingAndTheMemberAlone(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
@@ -198,14 +228,15 @@ func TestARetakeCountsEvenWhenItComesBackWorse(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
 	}
 
 	require.Eventually(t, func() bool {
-		return remoteOf(t, smart, key, "a") == ms(90)
+		value, _ := remoteReading(smart, key, "a")
+		return value == ms(90)
 	}, time.Second, time.Millisecond,
 		"the retake is the newer reading, better or worse")
 }
@@ -223,7 +254,7 @@ func TestAnAddressDestinationIsNeverAskedTwice(t *testing.T) {
 	require.False(t, destination.IsFqdn())
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
@@ -249,7 +280,7 @@ func TestTheOnlyGroupIsNeverAskedTwice(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
@@ -273,13 +304,67 @@ func TestASmallLookupIsNotWorthASecondConnection(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
 	}
 
 	require.Never(t, func() bool { return out.dials() > 1 }, 100*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestRetakesPastTheBacklogAreDroppedRatherThanQueued(t *testing.T) {
+	t.Parallel()
+	// Retakes wait on the probe slots the heartbeat and the confirming probe
+	// wait on too, first come first served. Queued without a bound, a run of
+	// new names put thousands of them ahead of the next heartbeat: after two
+	// seconds of random subdomains it waited 18 seconds for a 50ms dial. Past
+	// the backlog a retake is turned away on the spot — all it would have done
+	// is sharpen a reading, and the cold one still stands.
+	cold := &answeringOutbound{measurement: resolved(ms(20), ms(5), 0)}
+	release := cold.hold(t)
+	// Never measured, so a retake through it is budgeted probeTimeoutCold and
+	// none gives up on its own while the test holds the exit.
+	coldMember := newMember("a-1", 0)
+	coldMember.outbound = cold
+	smart := &Smart{
+		ctx:    context.Background(),
+		logger: logger.NOP(),
+		alpha:  testAlpha,
+		cache:  newSmartCache(context.Background(), "smart"),
+		// b is only the challenger that makes a retake worth anything.
+		groups: []*smartGroup{
+			{tag: "a", members: []*smartMember{coldMember}},
+			{tag: "b", members: []*smartMember{newMember("b-1", ms(20))}},
+		},
+	}
+	legs := map[string]racedLeg{"a": {member: coldMember, resolve: ms(50)}}
+
+	const races = 3 * amendBacklog
+	var (
+		returned atomic.Int32
+		done     sync.WaitGroup
+	)
+	for i := range races {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			destination := M.ParseSocksaddr(fmt.Sprintf("r%d.example.com:443", i))
+			smart.amendColdResolutions(destinationKey(destination), destination, &destinationEntry{}, legs)
+			returned.Add(1)
+		}()
+	}
+	// The retakes let in hold every probe slot or wait behind those that do,
+	// and none of them can finish while the exit is held — so every race past
+	// the backlog has to come back on its own, without its retake.
+	require.Eventually(t, func() bool { return returned.Load() == races-amendBacklog },
+		5*time.Second, time.Millisecond,
+		"only the backlog may wait on the probe slots; the rest is dropped")
+
+	release()
+	done.Wait()
+	require.EqualValues(t, amendBacklog, cold.dials.Load(),
+		"a dropped retake is not dialed later either")
 }
 
 func TestAnAmendedReadingSurvivesARestart(t *testing.T) {
@@ -292,26 +377,34 @@ func TestAnAmendedReadingSurvivesARestart(t *testing.T) {
 	// before it begins.
 	cache := onDisk(t)
 	challenger := &resolvingOutbound{
-		cold: resolved(ms(20), ms(5), ms(50)),
-		warm: resolved(ms(20), ms(5), 0),
+		cold:     resolved(ms(20), ms(5), ms(50)),
+		warm:     resolved(ms(20), ms(5), 0),
+		warmGate: make(chan struct{}),
 	}
 	smart := newWarmFixtureOn(t, cache, map[string]*resolvingOutbound{"a": challenger, "b": warmSibling()})
 	destination := M.ParseSocksaddr("example.com:443")
 	key := destinationKey(destination)
 
-	_, conn, err := smart.race(context.Background(), key, destination, nil)
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	if conn != nil {
 		require.NoError(t, conn.Close())
 	}
+	// The periodic flush writing the race's own snapshot before the retake
+	// lands, so only the retake's own mark can get the amendment written.
+	require.NoError(t, cache.flush())
+	close(challenger.warmGate)
 	require.Eventually(t, func() bool {
-		return remoteOf(t, smart, key, "a") == ms(5)
+		value, _ := remoteReading(smart, key, "a")
+		return value == ms(5)
 	}, time.Second, time.Millisecond)
 
 	// What a restart sees: a fresh cache over the same database. Read rather
 	// than assumed, because the amendment reaches memory before it reaches the
 	// disk and the gap between the two is exactly what this is checking.
 	onRestart := func() (time.Duration, bool) {
+		// What the periodic flush does; the retake no longer flushes itself.
+		require.NoError(t, cache.flush())
 		restarted := newSmartCache(context.Background(), "smart")
 		restarted.resolve.Do(func() { restarted.cacheFile = cache.cacheFile })
 		restarted.preload()
@@ -435,11 +528,14 @@ func TestAReadingCollectedAfterTheCallerLeftIsRetakenToo(t *testing.T) {
 			{tag: "a", bonus: ms(40), members: []*smartMember{slowMember}},
 			{tag: "b", members: []*smartMember{fastMember}},
 		},
+		// The gate opens after race returns, and on a loaded machine the
+		// answer can take longer than the real grace to come back.
+		raceGrace: raceDialTimeout,
 	}
 	destination := M.ParseSocksaddr("courier.example.com:443")
 	key := destinationKey(destination)
 
-	winner, conn, err := smart.race(context.Background(), key, destination, nil)
+	winner, _, conn, err := smart.race(context.Background(), key, destination, nil)
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 	require.Equal(t, "b", winner, "the caller was not made to wait for the straggler")

@@ -302,6 +302,34 @@ func (c *CacheFile) database() *bbolt.DB {
 	return c.DB
 }
 
+// ErrNotOpen is what View and Batch return before the database is open.
+var ErrNotOpen = E.New("cache file is not open")
+
+// Database is the handle as it stands, read under the lock that guards its
+// replacement after a corrupt file is reset; nil before the cache file starts.
+func (c *CacheFile) Database() *bbolt.DB {
+	return c.database()
+}
+
+// View and Batch run a transaction for a caller outside this package the way
+// this package runs its own: on the current handle, and with a corrupt file
+// reset rather than left to take the process down. The handle is checked
+// first because the reset that recovery performs cannot handle there being
+// none.
+func (c *CacheFile) View(fn func(tx *bbolt.Tx) error) error {
+	if c.database() == nil {
+		return ErrNotOpen
+	}
+	return c.view(fn)
+}
+
+func (c *CacheFile) Batch(fn func(tx *bbolt.Tx) error) error {
+	if c.database() == nil {
+		return ErrNotOpen
+	}
+	return c.batch(fn)
+}
+
 func (c *CacheFile) view(fn func(tx *bbolt.Tx) error) (err error) {
 	db := c.database()
 	defer func() {

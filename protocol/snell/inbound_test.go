@@ -3,6 +3,8 @@ package snell
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,9 +13,12 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	snellprotocol "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/snellv4"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 )
@@ -238,4 +243,78 @@ func TestQUICProxyAuthenticationQueueIsBounded(t *testing.T) {
 	}
 	overflowSource := M.ParseSocksaddrHostPort("127.0.0.1", uint16(quicProxyAuthenticationWorkers+quicProxyAuthenticationQueueSize+1))
 	require.False(t, service.Submit(overflowSource, []byte{1}))
+}
+
+// routedConnections hands every connection the inbound routes to the test.
+type routedConnections struct {
+	adapter.ConnectionRouterEx
+	conns chan net.Conn
+}
+
+func (r *routedConnections) RouteConnectionEx(_ context.Context, conn net.Conn, _ adapter.InboundContext, _ N.CloseHandlerFunc) {
+	r.conns <- conn
+}
+
+func newV5InboundForHandshake(t *testing.T) *Inbound {
+	t.Helper()
+	created, err := NewInbound(context.Background(), nil, log.NewNOPFactory().NewLogger("snell"), "snell-in",
+		option.SnellInboundOptions{
+			Version:                     5,
+			AbstractSnellInboundOptions: option.AbstractSnellInboundOptions{PSK: "test-password"},
+		})
+	require.NoError(t, err)
+	inbound := created.(*Inbound)
+	inbound.handshakeTimeout = 50 * time.Millisecond
+	return inbound
+}
+
+func TestASilentClientIsDroppedAtTheHandshakeTimeout(t *testing.T) {
+	t.Parallel()
+	// Nothing bounded the wait for the request, so a client that connected
+	// and sent nothing held a goroutine and a socket for as long as it liked.
+	inbound := newV5InboundForHandshake(t)
+	server, client := net.Pipe()
+	defer client.Close()
+
+	closed := make(chan error, 1)
+	go inbound.NewConnection(context.Background(), server, adapter.InboundContext{}, func(err error) { closed <- err })
+	select {
+	case err := <-closed:
+		require.True(t, E.IsTimeout(err), "dropped for the timeout, not anything else: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a client that sends nothing is still being waited for")
+	}
+	_, err := client.Read(make([]byte, 1))
+	require.Error(t, err, "and its socket is closed")
+}
+
+func TestTheHandshakeTimeoutEndsWithTheRequest(t *testing.T) {
+	t.Parallel()
+	// The bound is on sending the request, not on the stream after it: a
+	// connection that goes quiet once it is established must not be cut.
+	inbound := newV5InboundForHandshake(t)
+	router := &routedConnections{conns: make(chan net.Conn, 1)}
+	inbound.router = router
+	server, client := net.Pipe()
+	defer client.Close()
+	go inbound.NewConnection(context.Background(), server, adapter.InboundContext{}, func(error) {})
+
+	snellClient, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte("test-password")})
+	require.NoError(t, err)
+	stream, err := snellClient.DialConn(client, M.ParseSocksaddr("example.com:443"))
+	require.NoError(t, err)
+	var routed net.Conn
+	select {
+	case routed = <-router.conns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request was never routed")
+	}
+	defer routed.Close()
+
+	time.Sleep(4 * inbound.handshakeTimeout)
+	go func() { _, _ = stream.Write([]byte("hello")) }()
+	payload := make([]byte, 5)
+	_, err = io.ReadFull(routed, payload)
+	require.NoError(t, err, "quiet past the handshake timeout, and still open")
+	require.Equal(t, "hello", string(payload))
 }

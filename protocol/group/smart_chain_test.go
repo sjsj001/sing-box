@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/require"
 )
 
@@ -484,6 +485,8 @@ func TestASmallInteriorCannotSwallowADestinationThatMoved(t *testing.T) {
 	require.Greater(t, live, held*anomalyFactor, "the ratio alone would call this the interior")
 	require.Less(t, live-held, switchHysteresis, "while the move itself cannot decide anything")
 
+	// Held until the leg is read: the refresh the streak starts rewrites it.
+	release := fixture.outbounds["a"].hold(t)
 	for range anomalyStreak {
 		fixture.smart.observeScore(key, destination, group, member, moved)
 	}
@@ -492,6 +495,11 @@ func TestASmallInteriorCannotSwallowADestinationThatMoved(t *testing.T) {
 	remote, _ := entry.remoteFor("a")
 	require.Equal(t, ms(400), remote,
 		"the destination leg moved and the confirmation belongs to it")
+
+	release()
+	require.Eventually(t, func() bool {
+		return fixture.outbounds["a"].settledConns() == 1
+	}, time.Second, time.Millisecond, "the refresh the streak asked for still runs")
 }
 
 func TestDriftIsWeighedAgainstTheMemberThatCarriedTheConnection(t *testing.T) {
@@ -545,6 +553,8 @@ func TestDriftIsWeighedAgainstTheMemberThatCarriedTheConnection(t *testing.T) {
 		RoundTrip: ms(529), ServerSpan: ms(500), RemoteDial: ms(400),
 		HasSpan: true, HasRemote: true,
 	}
+	// Held until the leg is read: the refresh the streak starts rewrites it.
+	release := fixture.outbounds["a"].hold(t)
 	for range anomalyStreak {
 		fixture.smart.observeScore(key, destination, group, carrier, moved)
 	}
@@ -553,6 +563,11 @@ func TestDriftIsWeighedAgainstTheMemberThatCarriedTheConnection(t *testing.T) {
 	remote, _ := entry.remoteFor("a")
 	require.Equal(t, ms(400), remote,
 		"weighed against the carrier, its interior did not move and the destination did")
+
+	release()
+	require.Eventually(t, func() bool {
+		return fixture.outbounds["a"].settledConns() == 1
+	}, time.Second, time.Millisecond, "the refresh the streak asked for still runs")
 }
 
 func TestOurOwnUplinkGoingBadIsNotBlamedOnAnyMember(t *testing.T) {
@@ -588,6 +603,9 @@ func TestOurOwnUplinkGoingBadIsNotBlamedOnAnyMember(t *testing.T) {
 		RoundTrip: ms(900), ServerSpan: ms(11), RemoteDial: ms(5),
 		HasSpan: true, HasRemote: true,
 	}
+	// Held until the window is read: the refresh the streak starts banks its
+	// probe into the same member, and that sample is not the uplink's doing.
+	release := fixture.outbounds["a"].hold(t)
 	for range anomalyStreak {
 		fixture.smart.record(member, congested)
 		fixture.smart.observeScore(key, destination, group, member, congested)
@@ -596,4 +614,220 @@ func TestOurOwnUplinkGoingBadIsNotBlamedOnAnyMember(t *testing.T) {
 	after, _ := member.chain()
 	require.Equal(t, held, after,
 		"our uplink says nothing about the leg between the proxy and its exit")
+
+	release()
+	require.Eventually(t, func() bool {
+		return fixture.outbounds["a"].settledConns() == 1
+	}, time.Second, time.Millisecond, "the refresh the streak asked for still runs")
+}
+
+func TestTheFallbackPrefersAMeasuredRelayOverOneNothingHasCrossed(t *testing.T) {
+	t.Parallel()
+	// On the production core every member dials a leg on loopback, so near is
+	// ~0.2ms for all of them and the distance to the exit lives in the chain.
+	// hk has carried traffic (chain 35ms). us has only answered heartbeats,
+	// which the leg answers itself, so its chain window is empty, and empty
+	// counts as zero: the 150ms group looked adjacent. best() feeds UDP to a
+	// host with no TCP snapshot and the connections the race bound defers.
+	hk := &smartMember{tag: "hk-1"}
+	hk.healthy.Store(true)
+	for range 3 {
+		hk.record(naive.ConnMeasurement{
+			RoundTrip: 36 * time.Millisecond, ServerSpan: 35800 * time.Microsecond,
+			RemoteDial: 100 * time.Microsecond, HasSpan: true, HasRemote: true,
+		})
+	}
+	us := &smartMember{tag: "us-1"}
+	us.healthy.Store(true)
+	us.recordProbe(naive.ConnMeasurement{RoundTrip: 200 * time.Microsecond, HasSpan: true, HasRemote: true}, false)
+	eu := &smartMember{tag: "eu-1"}
+	eu.healthy.Store(true)
+	eu.recordProbe(naive.ConnMeasurement{RoundTrip: 100 * time.Microsecond, HasSpan: true, HasRemote: true}, false)
+	smart := &Smart{
+		alpha: testAlpha,
+		groups: []*smartGroup{
+			{tag: "us", members: []*smartMember{us}},
+			{tag: "eu", members: []*smartMember{eu}},
+			{tag: "hk", members: []*smartMember{hk}},
+		},
+	}
+	group, _ := smart.best()
+	require.Equal(t, "hk", group.tag,
+		"a member whose interior was never crossed is not known to be adjacent")
+
+	// Ranked after, not dropped: with hk's own leg unmeasured after a network
+	// change, the unmeasured groups are still ranked among themselves.
+	hk.resetPath()
+	group, _ = smart.best()
+	require.Equal(t, "eu", group.tag)
+}
+
+func TestAnUnmeasuredRelayCannotTakeACachedDestination(t *testing.T) {
+	t.Parallel()
+	// After a restart hk's chain came in first, 35ms; jp's window was still
+	// empty, so jp read as 0.3ms away, though it is 50ms. Scored as they
+	// stood, every destination cached on hk moved to jp, and back once jp's
+	// chain came in: two changes of exit address for nothing.
+	near := 300 * time.Microsecond
+	hk := candidate{tag: "hk", local: ms(35) + near, hasLocal: true, chain: ms(35), hasChain: true, remote: ms(1), hasRemote: true}
+	jp := candidate{tag: "jp", local: near, hasLocal: true, remote: ms(1), hasRemote: true}
+	for _, incumbent := range []string{"hk", ""} {
+		chosen, reason := selectGroup(testAlpha, []candidate{hk, jp}, incumbent)
+		require.Equal(t, "hk", chosen, "incumbent %q", incumbent)
+		require.Equal(t, reasonScore, reason)
+	}
+	chosen, _ := selectGroup(testAlpha, []candidate{hk, jp}, "jp")
+	require.Equal(t, "jp", chosen, "a place it holds, it keeps")
+
+	// Without relays an empty window hides no distance, and scores rank as
+	// before.
+	direct := hk
+	direct.chain, direct.local = 500*time.Microsecond, 500*time.Microsecond+near
+	chosen, _ = selectGroup(testAlpha, []candidate{direct, jp}, "")
+	require.Equal(t, "jp", chosen)
+}
+
+func TestAMemberIsProbedOnARealAddressUntilItsInteriorIsMeasured(t *testing.T) {
+	t.Parallel()
+	// The chain window lives in memory, so after a start every member is
+	// unmeasured, and the heartbeat address — which the first proxy answers
+	// itself — can never measure it. Three real readings settle it, warmup
+	// included: then a member with no interior is back on the probe address,
+	// and a relay stays on real ones.
+	direct := &answeringOutbound{measurement: answering(ms(30), ms(1))}
+	relay := &answeringOutbound{measurement: naive.ConnMeasurement{
+		RoundTrip: ms(70), ServerSpan: ms(40), RemoteDial: ms(1), HasSpan: true, HasRemote: true,
+	}}
+	members := []*smartMember{{tag: "direct", outbound: direct}, {tag: "relay", outbound: relay}}
+	for _, member := range members {
+		member.healthy.Store(true)
+	}
+	s := &Smart{ctx: context.Background(), logger: logger.NOP(), cache: newSmartCache(context.Background(), "smart")}
+	for range medianQuorum + 1 {
+		s.probeMembers(context.Background(), members)
+	}
+	real := func(out *answeringOutbound) (crossed []bool) {
+		for _, destination := range out.dialed {
+			crossed = append(crossed, !naive.IsProbe(destination))
+		}
+		return crossed
+	}
+	require.Equal(t, []bool{true, true, true, false}, real(direct))
+	require.Equal(t, []bool{true, true, true, true}, real(relay))
+}
+
+// udpAnsweringOutbound is answeringOutbound for a member that carries UDP.
+type udpAnsweringOutbound struct{ *answeringOutbound }
+
+func (o udpAnsweringOutbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
+
+func TestWarmupMeasuresEveryInteriorBeforeTheFirstFlow(t *testing.T) {
+	t.Parallel()
+	// The core's legs are all on loopback, so the distance to each exit is in
+	// the interior, which counts after three crossings and lives in memory.
+	// One warmup probe each left every relay unmeasured, and QUIC to a host
+	// with no TCP snapshot went to the relay with the nearest leg: us, 150ms
+	// away, ahead of hk at 35ms, until the heartbeat had come round twice.
+	relay := func(near, chain time.Duration) udpAnsweringOutbound {
+		return udpAnsweringOutbound{&answeringOutbound{measurement: naive.ConnMeasurement{
+			RoundTrip: near + chain + ms(1), ServerSpan: chain + ms(1), RemoteDial: ms(1),
+			HasSpan: true, HasRemote: true,
+		}}}
+	}
+	us := &smartMember{tag: "us-1", outbound: relay(100*time.Microsecond, ms(150))}
+	hk := &smartMember{tag: "hk-1", outbound: relay(300*time.Microsecond, ms(35))}
+	deadOut := &countingOutbound{}
+	dead := &smartMember{tag: "sg-1", outbound: deadOut}
+	s := &Smart{
+		ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart"),
+		groups: []*smartGroup{
+			{tag: "us", members: []*smartMember{us}},
+			{tag: "hk", members: []*smartMember{hk}},
+			{tag: "sg", members: []*smartMember{dead}},
+		},
+	}
+	for _, member := range []*smartMember{us, hk, dead} {
+		member.healthy.Store(true)
+	}
+
+	s.warmup(context.Background())
+	for _, member := range []*smartMember{us, hk} {
+		_, measured := member.chain()
+		require.True(t, measured, "%s's interior is known once warmup is done", member.tag)
+	}
+	require.EqualValues(t, 2, deadOut.dials.Load(),
+		"a member the first round condemned is not asked twice more: both real addresses, once")
+	_, group, _ := s.groupFor(context.Background(), M.ParseSocksaddr("quic.example.com:443"), N.NetworkUDP)
+	require.Equal(t, "hk", group.tag)
+}
+
+func TestUDPToAHostBeingRacedLeavesWhereTheRaceDecides(t *testing.T) {
+	t.Parallel()
+	// A browser that knows a host speaks h3 opens it over TCP and QUIC at
+	// once. The QUIC flow took the static ranking (a: bound 14ms) while the
+	// TCP connection waited for the race (b: 33ms against 74ms), so one site
+	// left from two exits.
+	fixture := newRaceFixture(t, 0, map[string][2]time.Duration{"a": {ms(20), ms(60)}, "b": {ms(40), ms(5)}})
+	for _, group := range fixture.smart.groups {
+		group.members[0].outbound = udpAnsweringOutbound{fixture.outbounds[group.tag]}
+	}
+	releaseA := fixture.outbounds["a"].hold(t)
+	releaseB := fixture.outbounds["b"].hold(t)
+	destination := M.ParseSocksaddr("h3.example.com:443")
+	conn, err := fixture.smart.dialTCP(context.Background(), destination)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, group, _ := fixture.smart.groupFor(gone, destination, N.NetworkUDP)
+	require.Equal(t, "a", group.tag, "a caller that has left does not wait")
+
+	picked := make(chan string, 1)
+	go func() {
+		_, group, _ := fixture.smart.groupFor(context.Background(), destination, N.NetworkUDP)
+		picked <- group.tag
+	}()
+	select {
+	case tag := <-picked:
+		t.Fatalf("UDP left by %s before the race decided", tag)
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseA()
+	releaseB()
+	require.Equal(t, "b", <-picked)
+}
+
+func TestUDPWaitsForARaceNothingAnswersOnlySoLong(t *testing.T) {
+	t.Parallel()
+	// A race nothing answers runs on for raceDialTimeout; the QUIC flow's
+	// first packet leaves by the static ranking well before that.
+	fixture := newRaceFixture(t, 0, map[string][2]time.Duration{"a": {ms(20), ms(60)}, "b": {ms(40), ms(5)}})
+	for _, group := range fixture.smart.groups {
+		group.members[0].outbound = udpAnsweringOutbound{fixture.outbounds[group.tag]}
+	}
+	fixture.smart.raceFollowLimit = 50 * time.Millisecond
+	release := []func(){fixture.outbounds["a"].hold(t), fixture.outbounds["b"].hold(t)}
+	defer func() {
+		for _, r := range release {
+			r()
+		}
+	}()
+	destination := M.ParseSocksaddr("h3.example.com:443")
+	conn, err := fixture.smart.dialTCP(context.Background(), destination)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	picked := make(chan string, 1)
+	go func() {
+		_, group, _ := fixture.smart.groupFor(context.Background(), destination, N.NetworkUDP)
+		picked <- group.tag
+	}()
+	select {
+	case tag := <-picked:
+		require.Equal(t, "a", tag, "the static ranking, once the wait is up")
+	case <-time.After(2 * time.Second):
+		t.Fatal("UDP still waiting on a race nothing answers")
+	}
 }

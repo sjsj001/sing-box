@@ -29,6 +29,21 @@ type racedLeg struct {
 // refresh, for as long as the snapshot lives.
 const warmResolverBias = switchHysteresis
 
+// amendBacklog bounds the retakes waiting on or holding a probe slot.
+//
+// Those are the four slots the heartbeat and the confirming probe wait on too,
+// first come first served. Unbounded, every race on a new name queued one
+// retake per cold group, and a run of new names — random subdomains, or only a
+// page load — grew the queue faster than four slots drain it: two seconds of
+// that left 1700 goroutines waiting and a heartbeat 18 seconds behind them for
+// a dial of 50ms, with nothing condemned confirmed or revived in between.
+//
+// ponytail: past the bound a retake is dropped, not queued, and the cold
+// reading stands until the snapshot's next refresh — what every reading did
+// before retakes existed. In a hundred-name burst most retakes go; if that
+// costs real decisions, give retakes their own slots instead.
+const amendBacklog = 16
+
 // amendColdResolutions takes a second destination reading for every group whose
 // first one was mostly the exit looking the destination up.
 //
@@ -90,9 +105,14 @@ func (s *Smart) amendColdResolutions(key string, destination M.Socksaddr, entry 
 		amended []auditLeg
 	)
 	for _, tag := range cold {
+		if s.amendQueued.Add(1) > amendBacklog {
+			s.amendQueued.Add(-1)
+			continue
+		}
 		wait.Add(1)
 		go func(tag string) {
 			defer wait.Done()
+			defer s.amendQueued.Add(-1)
 			// The same gate the heartbeat uses. These dials are worth less than
 			// anything a caller is waiting for, and a race across many groups
 			// would otherwise put a burst of them out at once.
@@ -131,18 +151,12 @@ func (s *Smart) amendColdResolutions(key string, destination M.Socksaddr, entry 
 	// The race that chose is already in the trail with the numbers it chose on,
 	// and those are no longer the numbers this destination is routed by.
 	s.auditAmend(key, destination.String(), amended)
-	// Marked before flushing, and that order is the whole of it: a flush writes
-	// what has been marked changed, and amendRemote alters an entry in place
-	// rather than replacing it, so nothing marks it. Without this the flush
-	// below finds an empty set and writes nothing — the amendment lives in
-	// memory until the process ends, and a restart brings back the very reading
-	// it was taken to replace, handicap and all.
+	// amendRemote alters the entry in place rather than replacing it, so
+	// nothing else marks it changed. Without the mark the next flush writes
+	// nothing for it, and a restart brings back the reading it replaced.
+	// Written by the timer like the race's own snapshot: a flush of its own
+	// cost a commit and two fsyncs per new hostname.
 	s.cache.touch(key)
-	// Persisted for the same reason a race result is: this is the reading the
-	// snapshot will be believed on for hours.
-	if err := s.cache.flush(); err != nil {
-		s.logger.Debug("persist amended snapshot for ", destination, ": ", err)
-	}
 }
 
 // warmLeg measures the destination through one member again, against an exit
@@ -164,7 +178,7 @@ func (s *Smart) warmLeg(member *smartMember, destination M.Socksaddr) (time.Dura
 	ctx, cancel := context.WithTimeout(s.ctx, s.probeTimeout(member, destination))
 	defer cancel()
 
-	conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+	conn, err := member.outbound.DialContext(naive.WithProbe(ctx), N.NetworkTCP, destination)
 	if err != nil {
 		s.logger.Debug("warm ", destination, " through ", member.tag, ": ", err)
 		return 0, false

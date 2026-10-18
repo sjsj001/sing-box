@@ -49,6 +49,22 @@ func IsProbe(destination M.Socksaddr) bool {
 	return strings.HasSuffix(destination.Fqdn, probeSuffix)
 }
 
+type probeContextKey struct{}
+
+// WithProbe marks a dial as the smart outbound measuring rather than anyone's
+// traffic. IsProbe only covers the heartbeat address; the confirming probes go
+// to real addresses and a race probe to the destination itself, and logged as
+// traffic they read as a user visiting Cloudflare, or as one connection dialed
+// five times.
+func WithProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, probeContextKey{}, true)
+}
+
+// IsProbeContext reports whether WithProbe marked this dial.
+func IsProbeContext(ctx context.Context) bool {
+	return ctx.Value(probeContextKey{}) != nil
+}
+
 // A CONNECT that cannot be established is answered with one of two statuses so a
 // client can tell a destination-specific problem from a node-wide one:
 // StatusBadGateway means the innermost proxy could not reach the destination,
@@ -87,13 +103,23 @@ var (
 	// which does not match this one.
 	//
 	// It has to be a distinct sentinel rather than net.ErrClosed, which reaches
-	// a caller from both directions: cronet's error type reports
-	// ERR_CONNECTION_CLOSED, _RESET, _ABORTED and _SOCKET_NOT_CONNECTED as
-	// matching that one, and those four are exactly the failures that do say
-	// something about a node. Judging on it would excuse a proxy the network had
-	// just reset. It still wraps net.ErrClosed, because sing tests for that
+	// a caller from both directions: cronet's error type reports six errors as
+	// matching that one. Two of them, ERR_ABORTED and ERR_NETWORK_CHANGED, only
+	// this end produces, and localClose turns them into this one. The other four,
+	// ERR_CONNECTION_CLOSED, ERR_CONNECTION_RESET, ERR_CONNECTION_ABORTED and
+	// ERR_SOCKET_NOT_CONNECTED, are exactly the failures that do say something
+	// about a node. Judging on net.ErrClosed would excuse a proxy the network
+	// had just reset. It still wraps net.ErrClosed, because sing tests for that
 	// sentinel to keep a closed connection quiet everywhere else.
 	ErrClosedLocally = fmt.Errorf("%w (closed by this end)", net.ErrClosed)
+
+	// ErrStreamRefused marks a stream the proxy closed without processing it:
+	// HTTP/2 REFUSED_STREAM, which is what a session closing for idleness
+	// answers to a stream that raced its GOAWAY. RFC 9113 §8.7 guarantees none
+	// of it was acted on. So it is no reading of the proxy, and nothing written
+	// on it went anywhere. Only cronet-go's NaiveClient.DialContext retries it
+	// on a fresh session; this package's outbound dials early and does not.
+	ErrStreamRefused = errors.New("stream refused unprocessed")
 )
 
 // RemoteDialReporter is implemented by outbound connections that can report the
@@ -109,10 +135,11 @@ type RemoteDialReporter interface {
 // early payload died at a proxy — so it must never come out of a default for
 // an error nobody classified. The plain fallthrough below is safe on exactly
 // one condition: unclassified errors reach here only from this hop's own dial
-// toward the destination (HandshakeFailure), where the failure is by
-// construction a verdict about the destination and no payload has moved. The
-// one path that handles someone else's errors — the next-hop conversation in
-// settleFromNextHop — classifies before calling.
+// toward the destination (HandshakeFailure, before anything is being resolved
+// from a next hop), where the failure is by construction a verdict about the
+// destination and no payload has moved. The one path that handles someone
+// else's errors — the next-hop conversation in settleFromNextHop — classifies
+// before calling, and failure defers to it once that conversation has begun.
 func statusForError(err error) int {
 	if errors.Is(err, ErrNextHopUnreachable) {
 		return http.StatusServiceUnavailable
@@ -241,9 +268,22 @@ func (r *responder) settle(statusCode int, ack ConnectAck, hasAck bool) error {
 //
 // Only the HTTP/2 path needs it. A hijacked connection outlives its handler by
 // design, and answering late on one is correct rather than fatal.
+//
+// A relay waits for its resolver before raising the flag. A handler that
+// returns having written nothing is answered by net/http with a 200, and a
+// CONNECT carrying no payload — a probe — through a relay whose next hop was
+// down got exactly that, three times in four: the resolver lost the race to
+// the flag, its 503 was dropped, and the client read a relay with no way out
+// as reachable. The wait is short: the copy loop closed the next-hop
+// connection before it let the handler go, so RemoteAck returns at once with
+// the classified answer — the next hop's own 502 included — and a client that
+// hung up ends the wait through the context.
 func (r *responder) finish() {
 	if r == nil {
 		return
+	}
+	if r.resolving.Load() {
+		_ = r.await()
 	}
 	r.access.Lock()
 	r.finished = true
@@ -318,6 +358,20 @@ func (r *responder) settleFromNextHop(reporter RemoteDialReporter) {
 		}
 	}
 	ack, hasAck := r.spans()
+	// A stream that had to wait for a new session to the next hop measured a
+	// handshake, not the path. Left in the span it lands in the client's
+	// chain window, whose rolling cost drops only the worst of eight, and a
+	// burst of cold streams moved a group off its exit; taken out, it lands
+	// in the client's near hop, a rolling minimum. Only this hop's: a deeper
+	// relay's handshake is inside the next hop's answer, not told apart here.
+	if measured, isMeasured := reporter.(MeasuredConn); isMeasured && hasAck {
+		if next, err := measured.Measure(r.ctx); err == nil {
+			destination, _ := ack.DestinationLeg()
+			if trimmed := ack.Total - next.Setup; trimmed >= destination {
+				ack.Total = trimmed
+			}
+		}
+	}
 	if settleErr := r.settle(http.StatusOK, ack, hasAck); settleErr != nil {
 		r.logger.DebugContext(r.ctx, "write connect response: ", settleErr)
 	}
@@ -326,6 +380,17 @@ func (r *responder) settleFromNextHop(reporter RemoteDialReporter) {
 func (r *responder) failure(err error) error {
 	if r == nil {
 		return nil
+	}
+	if r.resolving.Load() {
+		// The next hop's answer is being resolved, and what arrives here is
+		// the copy loop seeing the same failure raw: a connection refused with
+		// no one's classification on it, which statusForError can only read as
+		// a verdict about the destination. Answered that way, a relay whose
+		// next hop was down said 502, and its client cooled the destination's
+		// port for the whole group instead of condemning the member. The
+		// resolver classifies — the next hop's own 502 stays a 502 — so the
+		// answer is its, and this only waits for it.
+		return r.await()
 	}
 	return r.settle(statusForError(err), ConnectAck{}, false)
 }

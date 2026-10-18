@@ -1,7 +1,9 @@
 package group
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -18,9 +20,9 @@ import (
 // Measuring a destination nobody has measured yet: one round of probes across
 // every group, read in the order the decision core says is worth waiting for.
 //
-// A probe carries no payload, so the destination sees a connection and nothing
-// more, and the winner's tunnel is the one the caller gets — there is no second
-// dial.
+// A probe carries at most the caller's ClientHello (see raceCarrying), so the
+// destination sees a handshake begun and nothing more, and the winner's tunnel
+// is the one the caller gets — there is no second dial.
 
 type probeOutcome struct {
 	tag         string
@@ -40,16 +42,16 @@ type probeOutcome struct {
 
 // probe opens a tunnel through one group and waits for the proxy's answer.
 //
-// The tunnel carries no payload, so the destination sees a connection and
-// nothing else — which is what makes it safe to open several at once. The
-// winner's tunnel is already established, so the payload goes onto it directly
-// with no second dial.
+// The tunnel carries nothing that asks the destination for anything — at most
+// a ClientHello, see helloCarrier — which is what makes it safe to open several
+// at once. The winner's tunnel is already established, so the payload goes
+// onto it directly with no second dial.
 //
 // The send is unconditional and the channel is sized to hold exactly one
 // outcome per probe, so delivery never blocks and never depends on anyone still
 // listening. That is what makes the count in race exact, and the count is what
 // closes the tunnels of probes that answered after the race had walked away.
-func (s *Smart) probe(ctx context.Context, key string, group *smartGroup, destination M.Socksaddr, results chan<- probeOutcome) {
+func (s *Smart) probe(ctx context.Context, key string, group *smartGroup, destination M.Socksaddr, results chan<- probeOutcome, carrier *helloCarrier) {
 	outcome := probeOutcome{tag: group.tag}
 	defer func() { results <- outcome }()
 
@@ -59,7 +61,7 @@ func (s *Smart) probe(ctx context.Context, key string, group *smartGroup, destin
 		return
 	}
 	outcome.member = member
-	conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+	conn, err := member.outbound.DialContext(naive.WithProbe(ctx), N.NetworkTCP, destination)
 	if err != nil {
 		outcome.err = err
 		s.reportFailure(key, destination, group, member, err)
@@ -72,6 +74,9 @@ func (s *Smart) probe(ctx context.Context, key string, group *smartGroup, destin
 		outcome.err = E.New("outbound ", member.tag, " does not report measurements")
 		return
 	}
+	// Only once it is known to take part: a tunnel dropped for reporting
+	// nothing must not have been handed the hello on its way out.
+	carrier.attach(conn)
 	if err = s.awaitReady(ctx, member, conn); err != nil {
 		outcome.err = err
 		s.reportFailure(key, destination, group, member, err)
@@ -158,8 +163,10 @@ func (s *Smart) awaitReady(ctx context.Context, member *smartMember, conn net.Co
 	if err == nil {
 		return nil
 	}
-	if ctx.Err() == nil && bounded.Err() != nil {
-		// The bound this outbound set, not one the caller imposed.
+	if ctx.Err() == nil && bounded.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+		// The bound this outbound set, not one the caller imposed — and the
+		// wait ended on it. A failure the stream reported in the same instant
+		// keeps its own name: renamed, a refused stream condemned its member.
 		err = errLegTimedOut
 	}
 	return fmt.Errorf("%w: %w", naive.ErrNextHopUnreachable, err)
@@ -251,7 +258,7 @@ func short(d time.Duration) string {
 }
 
 // race measures every group against a destination and returns the winner's
-// already-open tunnel.
+// already-open tunnel, and the member it was measured through.
 //
 // The caller is not made to wait for the whole story. It gets the best tunnel
 // on the schedule the deadline math sets; groups still unanswered then are
@@ -259,7 +266,7 @@ func short(d time.Duration) string {
 // from whoever answered at all — see collectStragglers for why the two
 // schedules have to be different. run, when not nil, is the single-flight
 // claim, released once the last write has landed.
-func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, run *raceRun) (string, net.Conn, error) {
+func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, run *raceRun) (string, *smartMember, net.Conn, error) {
 	now := time.Now()
 	entry := s.cache.load(key)
 	// The selection this destination entered the race with. Both snapshot
@@ -274,7 +281,7 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 		candidates []candidate
 		racing     []*smartGroup
 	)
-	for _, c := range s.candidates(entry, now) {
+	for _, c := range s.candidates(entry, destination.Port, now) {
 		group := s.group(c.tag)
 		if group == nil {
 			continue
@@ -284,7 +291,7 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 	}
 	if len(racing) == 0 {
 		s.settleRace(key, run)
-		return "", nil, errNoUsableGroup(destination)
+		return "", nil, nil, s.errNoCandidate(entry, destination, now)
 	}
 
 	// Derived from the outbound's lifetime, not the caller's: a probe outlives
@@ -295,7 +302,7 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 
 	results := make(chan probeOutcome, len(racing))
 	for _, group := range racing {
-		go s.probe(raceCtx, key, group, destination, results)
+		go s.probe(raceCtx, key, group, destination, results, run.carrier())
 	}
 	// Every probe delivers exactly one outcome, so what the loop below does not
 	// read is exactly what a drainer has to close.
@@ -393,7 +400,7 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 					run.decide()
 				}
 				handOff(len(racing)-answered, raceDialTimeout-time.Since(started))
-				return "", nil, ctx.Err()
+				return "", nil, nil, ctx.Err()
 			}
 			// An answer is in hand: the caller leaves with it, and the groups
 			// still unanswered go through the same grace as any other race.
@@ -403,8 +410,9 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 			break
 		}
 		bound, hasBound := state.waitUntil(firstAnswerAt)
-		if !hasBound {
-			// Nothing has answered yet; keep waiting on the dial budget.
+		if !hasBound || s.raceIgnoresDeadline {
+			// Nothing has answered yet, or a test is waiting for every answer;
+			// keep waiting on the dial budget.
 			continue
 		}
 		remaining := bound - time.Since(started)
@@ -422,8 +430,11 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 	}
 
 	winner, hasWinner := state.winner()
+	// Read before a hand-off: the collector goes on filling legs.
+	winnerMember := legs[winner].member
 	// Close everything that did not win. Their measurements are already banked,
-	// and the destination only ever carried a connection attempt from them.
+	// and the destination only ever carried a connection attempt, or a
+	// ClientHello, from them.
 	for tag, conn := range conns {
 		if tag != winner || !hasWinner {
 			conn.Close()
@@ -463,12 +474,12 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 			}
 			state.pending[c.tag] = true
 		}
-		s.storeSnapshot(key, destination, snapshotBasis{replacing: entry, carryFrom: entry}, provisional, cloneDurations(local), anchor)
+		s.storeSnapshot(key, destination, snapshotBasis{replacing: s.cache.load(key), carryFrom: entry}, provisional, cloneDurations(local), anchor)
 		if run != nil {
 			run.decide()
 		}
-		handOff(pending, raceAnswerGrace)
-		return winner, conns[winner], nil
+		handOff(pending, cmp.Or(s.raceGrace, raceAnswerGrace))
+		return winner, winnerMember, conns[winner], nil
 	}
 
 	report := raceReport{
@@ -498,7 +509,7 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 		go drainProbes(results, pending)
 	}
 	if len(remote) > 0 {
-		s.storeSnapshot(key, destination, snapshotBasis{replacing: entry, carryFrom: entry}, report, local, anchor)
+		s.storeSnapshot(key, destination, snapshotBasis{replacing: s.cache.load(key), carryFrom: entry}, report, local, anchor)
 		go s.amendColdResolutions(key, destination, s.cache.load(key), legs)
 	} else {
 		// Nothing to store, but the attempt still counts. A destination that has
@@ -511,9 +522,26 @@ func (s *Smart) race(ctx context.Context, key string, destination M.Socksaddr, r
 	}
 	s.settleRace(key, run)
 	if !hasWinner {
-		return "", nil, E.New("no group could reach ", destination)
+		return "", nil, nil, raceFailure(destination, state.candidates, failures)
 	}
-	return winner, conns[winner], nil
+	return winner, winnerMember, conns[winner], nil
+}
+
+// raceFailure says why a round found nothing, in the terms a relay answers in.
+// "Every group refused" is a verdict about the destination: the relay answers
+// 502, and the hop downstream cools the destination down and may replay — safe,
+// since a probe carries at most a ClientHello and that died at the exit. It is
+// only that when every group was asked and every one said so. A leg that timed
+// out or broke is this node's trouble, and reported as the destination's it
+// left every new destination cooling down downstream through an outage here,
+// and still cooling after it ended.
+func raceFailure(destination M.Socksaddr, candidates []candidate, failures map[string]error) error {
+	for _, c := range candidates {
+		if !errors.Is(failures[c.tag], naive.ErrDestinationUnreachable) {
+			return E.Cause(naive.ErrNextHopUnreachable, "no group could reach ", destination)
+		}
+	}
+	return E.Cause(naive.ErrDestinationUnreachable, "every group refused ", destination)
 }
 
 func cloneDurations(m map[string]time.Duration) map[string]time.Duration {
@@ -555,16 +583,23 @@ type raceStragglers struct {
 // all.
 //
 // This is the half that makes the deadline honest. The deadline models an
-// answer as arriving at local + remote and is tight under that model; a real
-// answer arrives at local + span, and the difference — the proxy's own DNS,
-// resolved before it dials and charged to nobody — measured one to three
-// milliseconds warm and around fifty cold. Cold is the first time anyone asks
-// for a destination, which is exactly when races run, so the tight deadline
-// cut off precisely the strong challenger it was derived to wait for. Seen
-// twice in one night's trail: a group bounded at -10ms cut 0.4ms and 16ms
-// before its answer arrived, parking an apple.com destination on a group
+// answer as arriving at local + remote, local being the member's banked
+// estimate, and is tight under that model. The exit's lookup of the name —
+// one to three milliseconds warm, around fifty cold — used to fall outside
+// it, resolved before the exit dials and charged to nobody, and the tight
+// deadline cut off precisely the strong challenger it was derived to wait
+// for. Seen twice in one night's trail: a group bounded at -10ms cut 0.4ms and
+// 16ms before its answer arrived, parking an apple.com destination on a group
 // scoring 246ms for six hours, ineligible even to be reconsidered because a
 // group that never answers leaves no measurement.
+//
+// The lookup now travels in the destination leg (see
+// naive.ConnectAck.DestinationLeg), except from an exit too old to report it.
+// What is still outside the model is this connection's interior running over
+// the banked one, and that a lookup is cold exactly when races run — the first
+// time anyone asks for a destination — so a round's remote can carry a cost
+// the next connection will not pay. A challenger cut off on it leaves no
+// reading for amendColdResolutions to take again warm.
 //
 // Waiting here costs the caller nothing — it already has its tunnel — so the
 // grace can be generous where the deadline could not. If the full story names
@@ -669,6 +704,9 @@ type raceRun struct {
 	// instead, a client that opens connections to new destinations and cancels
 	// them keeps every slot free while the tails pile up unbounded.
 	release func()
+	// carry is where this round's probes pick up the caller's ClientHello;
+	// nil for a round no caller is waiting on.
+	carry *helloCarrier
 }
 
 func (r *raceRun) decide() {
@@ -713,9 +751,20 @@ func (s *Smart) settleRace(key string, run *raceRun) {
 // connections from every exit address at once, torn down again immediately —
 // which is the pattern grouping exists to avoid, arriving at the one moment the
 // group has not been chosen yet.
-func (s *Smart) raceOrWait(ctx context.Context, key string, destination M.Socksaddr) (net.Conn, error) {
+//
+// seen is the snapshot the caller decided to race on. A whole round can begin
+// and end between that look and the claim here — the caller read the cache
+// before the round wrote, and claims after the round let go — and racing then
+// probes the destination from every exit a second time. So the claim is only
+// raced on if the cache still says what the caller saw.
+func (s *Smart) raceOrWait(ctx context.Context, key string, destination M.Socksaddr, seen *destinationEntry) (net.Conn, error) {
 	run, leading := s.claimRace(key)
 	if leading {
+		current := s.cache.load(key)
+		if current != seen || (current != nil && !current.attemptDue(time.Now())) {
+			s.releaseRace(key, run)
+			return s.dialWithoutRacing(ctx, key, destination)
+		}
 		select {
 		case s.raceBound() <- struct{}{}:
 			run.release = func() { <-s.raceSlots }
@@ -728,16 +777,19 @@ func (s *Smart) raceOrWait(ctx context.Context, key string, destination M.Socksa
 			s.logger.DebugContext(ctx, "deferring race for ", destination, ": too many in flight")
 			return s.dialWithoutRacing(ctx, key, destination)
 		}
-		winner, conn, err := s.race(ctx, key, destination, run)
-		if err != nil {
+		// No group to race is known without a dial, and is said at once rather
+		// than on the first read the way a race that ran and failed is.
+		if now := time.Now(); len(s.candidates(current, destination.Port, now)) == 0 {
+			s.releaseRace(key, run)
+			return nil, s.errNoCandidate(current, destination, now)
+		}
+		conn := s.raceCarrying(ctx, key, destination, run)
+		if err := ctx.Err(); err != nil {
+			// The race ignores ctx so a dialer that cancels on return cannot
+			// end it; a caller already gone still has to, and Close says so.
+			conn.Close()
 			return nil, err
 		}
-		// The winner's tunnel goes straight to the caller, so a raced request is
-		// counted here — dialWithFailover never sees it.
-		if group := s.group(winner); group != nil {
-			s.countRequest(key, group, group.current(), reasonRaced, N.NetworkTCP)
-		}
-		s.logger.InfoContext(ctx, destination, " via ", winner, " by=", reasonRaced)
 		return conn, nil
 	}
 
@@ -762,20 +814,12 @@ func (s *Smart) raceOrWait(ctx context.Context, key string, destination M.Socksa
 // would otherwise start another round per connection.
 func (s *Smart) dialWithoutRacing(ctx context.Context, key string, destination M.Socksaddr) (net.Conn, error) {
 	entry := s.cache.load(key)
-	candidates := s.candidates(entry, time.Now())
+	now := time.Now()
+	candidates := s.candidates(entry, destination.Port, now)
 	if len(candidates) == 0 {
-		return nil, errNoUsableGroup(destination)
+		return nil, s.errNoCandidate(entry, destination, now)
 	}
-	var selected, reason string
-	if entry != nil {
-		selected, reason = selectGroup(s.alpha, candidates, entry.selected())
-	}
-	if selected == "" {
-		selected, reason = fallbackGroup(s.alpha, candidates), reasonFallback
-	}
-	if selected == "" {
-		return nil, errNoUsableGroup(destination)
-	}
+	selected, reason := s.chooseGroup(candidates, incumbentOf(entry))
 	return s.dialWithFailover(ctx, destination, key, selected, reason)
 }
 
@@ -796,7 +840,8 @@ func (s *Smart) raceDetached(key string, destination M.Socksaddr) {
 		s.releaseRace(key, run)
 		return
 	}
-	_, conn, err := s.race(s.ctx, key, destination, run)
+	// Nothing reads the tunnel, so it is closed as it comes, unwrapped.
+	_, _, conn, err := s.race(s.ctx, key, destination, run)
 	if err != nil {
 		s.logger.Debug("refresh race for ", destination, ": ", err)
 		return
@@ -821,7 +866,15 @@ func (s *Smart) raceBound() chan struct{} {
 // An entry with no measurements is not usable for routing — dialTCP still falls
 // through to a race — but it is enough to carry the backoff, and it costs one
 // slot in a cache that is bounded anyway.
+//
+// A round with no snapshot to start from may have made one by now: a refusal
+// files its cooldown on an entry of its own (see reportFailure). Replacing that
+// with a fresh one would drop the cooldowns, and the next connection would
+// dial every group the round just heard refuse.
 func (s *Smart) noteFailedRace(key string, entry *destinationEntry) {
+	if entry == nil {
+		entry = s.cache.load(key)
+	}
 	if entry == nil {
 		entry = &destinationEntry{}
 		s.cache.store(key, entry)
@@ -836,8 +889,11 @@ func (s *Smart) noteFailedRace(key string, entry *destinationEntry) {
 // that writes twice — provisional, then final — passes the provisional as
 // replacing, and judging the carry against it too would read this round's own
 // carry mark as a previous silent round and retire the incumbent's leg after
-// one round of silence instead of two. The fields only differ between those
-// two writes; everywhere else one entry fills both.
+// one round of silence instead of two. So a race reads replacing from the
+// cache at the moment it writes, never from the start of the round: a round
+// that began with no snapshot may have one by then, made by a refusal to hold
+// its cooldown (see reportFailure), and replacing the nil it started from
+// would drop that cooldown the moment the round learned it.
 type snapshotBasis struct {
 	replacing *destinationEntry
 	carryFrom *destinationEntry
@@ -869,8 +925,8 @@ func (s *Smart) storeSnapshot(key string, destination M.Socksaddr, basis snapsho
 	// once. Groups that did not answer this round are dropped, not carried
 	// forward wholesale: a window kept through silence would let a group stay
 	// eligible for hours on history alone, which is the cold-credit trap the
-	// entry's type comment describes — the one deliberate exception remains
-	// carryIncumbent, below.
+	// entry's type comment describes — the deliberate exceptions are in
+	// carryOver, below.
 	remote := make(map[string]remoteWindow, len(report.remote))
 	for tag, sample := range report.remote {
 		remote[tag] = basis.carryFrom.windowFor(tag).extend(sample)
@@ -882,7 +938,24 @@ func (s *Smart) storeSnapshot(key string, destination M.Socksaddr, basis snapsho
 		Members:  members,
 		RacedAt:  time.Now(),
 	}
-	updated.carryIncumbent(basis.carryFrom, selected, report.failures[selected])
+	updated.carryOver(basis.carryFrom, selected)
+	raced := make(map[string]bool, len(report.candidates))
+	for _, c := range report.candidates {
+		raced[c.tag] = true
+	}
+	for _, group := range s.groups {
+		// Left out — down, or cooling on this port — or refused this round,
+		// by the destination or by a session closing as the probe arrived —
+		// or cut off by this end: a member drops its sessions on a network
+		// change, mid-round, and that is no reading of the group either.
+		// Dropped, its leg left the group unselectable here until the
+		// snapshot expired.
+		failure := report.failures[group.tag]
+		if !raced[group.tag] || errors.Is(failure, naive.ErrDestinationUnreachable) ||
+			errors.Is(failure, naive.ErrStreamRefused) || errors.Is(failure, naive.ErrClosedLocally) {
+			updated.carryOver(basis.carryFrom, group.tag)
+		}
+	}
 	updated.carryCooldowns(basis.replacing)
 	updated.carryCounts(basis.replacing)
 	// Answering with a destination leg is the proof that whatever the group was
@@ -891,15 +964,14 @@ func (s *Smart) storeSnapshot(key string, destination M.Socksaddr, basis snapsho
 	// it, or a destination that came back would serve its longest escalation
 	// before anyone noticed.
 	for tag := range report.remote {
-		updated.reached(tag)
+		updated.reached(tag, destination.Port)
 	}
+	// Persisted by the loop's timer and by Close, not here. Writing here put a
+	// bbolt batch — a 10ms batch delay plus two syncs — between the race and
+	// the caller holding its winner, on every new destination. What it bought
+	// was the last half-minute of decisions surviving a crash, which costs no
+	// more than racing those destinations again.
 	s.cache.store(key, updated)
-	// A race is rare and its result is the whole point of running one. Waiting
-	// for the next timer tick to persist it means an early restart throws the
-	// decision away and races everything again.
-	if err := s.cache.flush(); err != nil {
-		s.logger.Debug("persist snapshot for ", destination, ": ", err)
-	}
 }
 
 // observeScore watches how the group in use is actually performing.
@@ -969,7 +1041,11 @@ func (s *Smart) observeScore(key string, destination M.Socksaddr, group *smartGr
 	// group with a large enough bonus is never checked for drift again.
 	was := score(s.alpha, recordedLocal, recordedRemote, 0)
 	now := score(s.alpha, measurement.NearHop()+liveChain, measurement.RemoteDial, 0)
-	if was <= 0 || now < was*anomalyFactor {
+	// The same floor beside the multiple as the interior check below, for the
+	// same reason: next to a near proxy and a CDN, a few milliseconds of
+	// jitter already doubles the score, and a move below switchHysteresis
+	// could not change a decision anyway.
+	if was <= 0 || now < was*anomalyFactor || now-was <= switchHysteresis {
 		entry.resetAnomalies()
 		return
 	}

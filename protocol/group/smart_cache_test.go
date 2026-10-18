@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -71,13 +72,13 @@ func TestUnreachableGroupIsExcludedUntilTheCooldownPasses(t *testing.T) {
 	// else, so the exclusion is scoped to the destination and it lapses.
 	now := time.Now()
 	entry := &destinationEntry{Remote: map[string]remoteWindow{"hk": {time.Millisecond}}}
-	require.False(t, entry.blocked("hk", now))
+	require.False(t, entry.blocked("hk", 443, nil, now))
 
-	entry.block("hk", now)
-	require.True(t, entry.blocked("hk", now))
-	require.True(t, entry.blocked("hk", now.Add(destinationFailureCooldown-time.Second)))
-	require.False(t, entry.blocked("hk", now.Add(destinationFailureCooldown+time.Second)))
-	require.False(t, entry.blocked("jp", now), "other groups must be untouched")
+	entry.block("hk", 443, now, nil)
+	require.True(t, entry.blocked("hk", 443, nil, now))
+	require.True(t, entry.blocked("hk", 443, nil, now.Add(destinationFailureCooldown-time.Second)))
+	require.False(t, entry.blocked("hk", 443, nil, now.Add(destinationFailureCooldown+time.Second)))
+	require.False(t, entry.blocked("jp", 443, nil, now), "other groups must be untouched")
 }
 
 func TestAnomalyNeedsASustainedRun(t *testing.T) {
@@ -123,27 +124,27 @@ func TestCooldownsAreCopiedOntoTheSnapshotThatReplacesThem(t *testing.T) {
 	// rather than merely reporting a race.
 	previous := &destinationEntry{Remote: map[string]remoteWindow{"a": {ms(1)}}}
 	now := time.Now()
-	previous.block("a", now)
+	previous.block("a", 443, now, nil)
 
 	updated := &destinationEntry{Remote: map[string]remoteWindow{"a": {ms(1)}}}
 	updated.carryCooldowns(previous)
-	require.True(t, updated.blocked("a", now), "the cooldown must survive the swap")
+	require.True(t, updated.blocked("a", 443, nil, now), "the cooldown must survive the swap")
 
-	updated.block("b", now)
-	require.False(t, previous.blocked("b", now), "the two entries must not share a map")
+	updated.block("b", 443, now, nil)
+	require.False(t, previous.blocked("b", 443, nil, now), "the two entries must not share a map")
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		for range 500 {
-			previous.block("c", now)
+			previous.block("c", 443, now, nil)
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for range 500 {
-			updated.block("c", now)
+			updated.block("c", 443, now, nil)
 		}
 	}()
 	wg.Wait()
@@ -358,6 +359,41 @@ func TestAbandonedSnapshotsAreNotKeptForever(t *testing.T) {
 	}))
 }
 
+func TestASnapshotFromTheFutureIsKeptAsWritten(t *testing.T) {
+	t.Parallel()
+	// Booted with the clock behind (no RTC, a restored VM), every row on disk
+	// is from the future. Its date is the only record of when it was raced:
+	// dropping it, or dating it by this clock and writing that back, loses it
+	// once NTP puts the clock right. So it is loaded and left exactly as it is.
+	cache := onDisk(t)
+	cache.store("recent", &destinationEntry{
+		Remote:  map[string]remoteWindow{"hk": {ms(5)}},
+		RacedAt: time.Now(),
+	})
+	racedAt := time.Now().Add(30 * 24 * time.Hour)
+	cache.store("future", &destinationEntry{
+		Remote:  map[string]remoteWindow{"hk": {ms(5)}},
+		RacedAt: racedAt,
+	})
+	require.NoError(t, cache.flush())
+
+	restarted := newSmartCache(context.Background(), "smart")
+	restarted.resolve.Do(func() { restarted.cacheFile = cache.cacheFile })
+	restarted.preload()
+
+	require.NotNil(t, restarted.load("recent"))
+	future := restarted.load("future")
+	require.NotNil(t, future, "kept: the wrong clock may be this one")
+	require.True(t, future.RacedAt.Equal(racedAt), "dated as written, not by this clock")
+	require.NoError(t, restarted.flush())
+	require.NoError(t, restarted.db().View(func(tx *bbolt.Tx) error {
+		var onDisk destinationEntry
+		require.NoError(t, json.Unmarshal(restarted.ownBucket(tx).Get([]byte("future")), &onDisk))
+		require.True(t, onDisk.RacedAt.Equal(racedAt), "and the row on disk still says so")
+		return nil
+	}))
+}
+
 func TestAFailedFlushDoesNotDiscardWhatItWasWriting(t *testing.T) {
 	t.Parallel()
 	// The marks are cleared before the write on the assumption it lands. If a
@@ -393,7 +429,7 @@ func TestTheGroupInUseKeepsItsPlaceThroughOneSilentRound(t *testing.T) {
 		Remote: map[string]remoteWindow{"hk": {ms(4)}},
 		Path:   map[string]time.Duration{"hk": ms(29)},
 	}
-	updated.carryIncumbent(previous, "jp", nil)
+	updated.carryOver(previous, "jp")
 
 	remote, found := updated.remoteFor("jp")
 	require.True(t, found, "the group in use has to stay comparable")
@@ -404,25 +440,8 @@ func TestTheGroupInUseKeepsItsPlaceThroughOneSilentRound(t *testing.T) {
 	// One round only. A group that stays silent through a second loses its place,
 	// so a stale value cannot live on a destination nobody can reach.
 	third := &destinationEntry{Remote: map[string]remoteWindow{"hk": {ms(5)}}}
-	third.carryIncumbent(updated, "jp", nil)
+	third.carryOver(updated, "jp")
 	_, found = third.remoteFor("jp")
-	require.False(t, found)
-}
-
-func TestAnIncumbentThatFailedIsNotCarried(t *testing.T) {
-	t.Parallel()
-	// Silence is the absence of evidence; a proxy saying it could not reach the
-	// destination is evidence. Carrying the group over the top of that would
-	// keep it selected on a measurement that has just been contradicted.
-	previous := &destinationEntry{
-		Remote:   map[string]remoteWindow{"jp": {ms(2)}},
-		Path:     map[string]time.Duration{"jp": ms(80)},
-		Selected: "jp",
-	}
-	updated := &destinationEntry{Remote: map[string]remoteWindow{"hk": {ms(4)}}}
-	updated.carryIncumbent(previous, "jp",
-		E.Cause(naive.ErrDestinationUnreachable, "unexpected response status: 502"))
-	_, found := updated.remoteFor("jp")
 	require.False(t, found)
 }
 
@@ -440,7 +459,7 @@ func TestOnlyTheGroupInUseIsCarried(t *testing.T) {
 		Remote: map[string]remoteWindow{"hk": {ms(4)}},
 		Path:   map[string]time.Duration{"hk": ms(29)},
 	}
-	updated.carryIncumbent(previous, "jp", nil)
+	updated.carryOver(previous, "jp")
 
 	require.Len(t, updated.Remote, 2, "only hk, which answered, and jp, which is in use")
 	for _, tag := range []string{"sg", "eu"} {
@@ -649,18 +668,11 @@ func TestALegBrokenOnTheWayToTheProxyDoesNotRetireTheIncumbent(t *testing.T) {
 	}
 
 	carried := &destinationEntry{Remote: map[string]remoteWindow{"hk": {ms(1)}}}
-	carried.carryIncumbent(previous, "jp",
-		E.Cause(naive.ErrNextHopUnreachable, "use of closed network connection"))
+	carried.carryOver(previous, "jp")
 	_, remote, ok := carried.legsFor("jp")
 	require.True(t, ok, "the broken leg says nothing about this destination")
 	require.Equal(t, ms(2), remote)
 	require.True(t, carried.carried("jp"), "and it is marked as inherited, not measured")
-
-	retired := &destinationEntry{Remote: map[string]remoteWindow{"hk": {ms(1)}}}
-	retired.carryIncumbent(previous, "jp",
-		E.Cause(naive.ErrDestinationUnreachable, "unexpected response status: 502"))
-	_, _, ok = retired.legsFor("jp")
-	require.False(t, ok, "the proxy answered, and what it said replaces what was known")
 }
 
 func TestPreloadDoesNotOverwriteADecisionMadeWhileItRan(t *testing.T) {
@@ -932,24 +944,24 @@ func TestARefusedDestinationBacksOffInsteadOfRetryingForEver(t *testing.T) {
 	entry := &destinationEntry{}
 	now := time.Now()
 
-	entry.block("us", now)
-	require.True(t, entry.blocked("us", now.Add(destinationFailureCooldown-time.Second)))
-	require.False(t, entry.blocked("us", now.Add(destinationFailureCooldown+time.Second)),
+	entry.block("us", 443, now, nil)
+	require.True(t, entry.blocked("us", 443, nil, now.Add(destinationFailureCooldown-time.Second)))
+	require.False(t, entry.blocked("us", 443, nil, now.Add(destinationFailureCooldown+time.Second)),
 		"the first refusal costs the base cooldown, as it always did")
 
 	// Each refusal in a row doubles what the next one costs.
-	entry.block("us", now)
-	require.True(t, entry.blocked("us", now.Add(2*destinationFailureCooldown-time.Second)))
-	entry.block("us", now)
-	require.True(t, entry.blocked("us", now.Add(4*destinationFailureCooldown-time.Second)))
+	entry.block("us", 443, now, nil)
+	require.True(t, entry.blocked("us", 443, nil, now.Add(2*destinationFailureCooldown-time.Second)))
+	entry.block("us", 443, now, nil)
+	require.True(t, entry.blocked("us", 443, nil, now.Add(4*destinationFailureCooldown-time.Second)))
 
 	// And it stops doubling, so a destination that does recover is not left
 	// waiting hours for anyone to look at it again.
 	for range 20 {
-		entry.block("us", now)
+		entry.block("us", 443, now, nil)
 	}
-	require.True(t, entry.blocked("us", now.Add(destinationFailureCooldownCap-time.Second)))
-	require.False(t, entry.blocked("us", now.Add(destinationFailureCooldownCap+time.Second)),
+	require.True(t, entry.blocked("us", 443, nil, now.Add(destinationFailureCooldownCap-time.Second)))
+	require.False(t, entry.blocked("us", 443, nil, now.Add(destinationFailureCooldownCap+time.Second)),
 		"the escalation is capped")
 }
 
@@ -961,13 +973,188 @@ func TestOneGroupsRefusalsDoNotFollowAnother(t *testing.T) {
 	entry := &destinationEntry{}
 	now := time.Now()
 	for range 5 {
-		entry.block("us", now)
+		entry.block("us", 443, now, nil)
 	}
-	entry.block("jp", now)
+	entry.block("jp", 443, now, nil)
 
-	require.True(t, entry.blocked("us", now.Add(8*destinationFailureCooldown)))
-	require.False(t, entry.blocked("jp", now.Add(destinationFailureCooldown+time.Second)),
+	require.True(t, entry.blocked("us", 443, nil, now.Add(8*destinationFailureCooldown)))
+	require.False(t, entry.blocked("jp", 443, nil, now.Add(destinationFailureCooldown+time.Second)),
 		"jp was refused once and pays for once")
+}
+
+func TestAPortScanThroughOneHostLeavesABoundedCooldownTable(t *testing.T) {
+	t.Parallel()
+	// A refusal is filed per group and port, and an expired one was removed
+	// only by the group reaching that port again — which on a scanned port
+	// never happens. A full port scan through the smart outbound filed 100000
+	// cooldowns on one host, held for as long as the host stayed in use and
+	// copied whole by every refresh of it.
+	entry := &destinationEntry{}
+	now := time.Now()
+	for port := range uint16(1000) {
+		entry.block("us", port+1, now, nil)
+	}
+	entry.access.Lock()
+	cooling, escalating := len(entry.unreachable), len(entry.refusals)
+	entry.access.Unlock()
+	require.Equal(t, cooldownKeysCap, cooling)
+	require.Equal(t, cooldownKeysCap, escalating)
+
+	// The bound is on how many ports are remembered, not on how far each one
+	// escalates: a port already cooling is refused again as it always was.
+	entry.block("us", 1, now, nil)
+	require.True(t, entry.blocked("us", 1, nil, now.Add(2*destinationFailureCooldown-time.Second)),
+		"a second refusal of a remembered port doubles its cooldown, full or not")
+
+	// Expired cooldowns are what make room, so a scan that has run its course
+	// does not keep the next real refusal out.
+	later := now.Add(destinationFailureCooldownCap)
+	entry.block("us", 443, later, nil)
+	require.True(t, entry.blocked("us", 443, nil, later))
+	entry.access.Lock()
+	cooling = len(entry.unreachable)
+	entry.access.Unlock()
+	require.Equal(t, 1, cooling, "the expired cooldowns are gone, not only outnumbered")
+}
+
+func TestARefreshOnABlockedPortDoesNotDropTheGroupForTheHost(t *testing.T) {
+	t.Parallel()
+	// The snapshot is per host and a refusal is per port. A refresh that
+	// happened to run on 25 dropped every group refusing 25 — the one that
+	// answered 502 and the one its cooldown kept out — and 443 moved to
+	// another exit for hours.
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart")}
+	for _, tag := range []string{"a", "b", "c"} {
+		smart.groups = append(smart.groups, &smartGroup{tag: tag, members: []*smartMember{newMember(tag+"-1", ms(30))}})
+	}
+	smtp := M.ParseSocksaddr("mail.example.com:25")
+	now := time.Now()
+	previous := &destinationEntry{
+		Remote:   map[string]remoteWindow{"a": {ms(9)}, "b": {ms(1)}, "c": {ms(2)}},
+		Path:     map[string]time.Duration{"a": ms(80), "b": ms(30), "c": ms(40)},
+		Selected: "b",
+		RacedAt:  now.Add(-time.Hour),
+	}
+	previous.block("b", 25, now, nil)
+	smart.cache.store("3f2a", previous)
+	refusal := E.Cause(naive.ErrDestinationUnreachable, "unexpected response status: 502")
+	round := func(basis *destinationEntry) *destinationEntry {
+		report := raceReport{
+			winner:     "a",
+			remote:     map[string]time.Duration{"a": ms(9)},
+			candidates: []candidate{{tag: "a", member: "a-1"}, {tag: "c", member: "c-1"}},
+			failures:   map[string]error{"c": refusal},
+		}
+		smart.storeSnapshot("3f2a", smtp, snapshotBasis{replacing: basis, carryFrom: basis}, report, nil, basis.selected())
+		return smart.cache.load("3f2a")
+	}
+
+	first := round(previous)
+	for _, tag := range []string{"b", "c"} {
+		_, found := first.remoteFor(tag)
+		require.True(t, found, tag+" keeps its leg for the other ports")
+		require.True(t, first.carried(tag))
+	}
+	require.True(t, first.blocked("b", 25, nil, now), "the port's cooldown is what keeps it off 25")
+
+	// One round only: a group refusing the host on every port still retires.
+	second := round(first)
+	for _, tag := range []string{"b", "c"} {
+		_, found := second.remoteFor(tag)
+		require.False(t, found, tag+" stayed out of two rounds")
+	}
+}
+
+func TestARefreshAProbeRacedAClosingSessionInKeepsItsLegs(t *testing.T) {
+	t.Parallel()
+	// A probe that raced its pooled session's idle GOAWAY was refused
+	// unprocessed. That is no reading of the group, and dropping its leg left
+	// it unselectable here until the snapshot expired.
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart")}
+	for _, tag := range []string{"a", "b"} {
+		smart.groups = append(smart.groups, &smartGroup{tag: tag, members: []*smartMember{newMember(tag+"-1", ms(30))}})
+	}
+	previous := &destinationEntry{
+		Remote:   map[string]remoteWindow{"a": {ms(9)}, "b": {ms(1)}},
+		Path:     map[string]time.Duration{"a": ms(80), "b": ms(30)},
+		Selected: "a",
+		RacedAt:  time.Now().Add(-time.Hour),
+	}
+	smart.cache.store("3f2a", previous)
+	report := raceReport{
+		winner:     "a",
+		remote:     map[string]time.Duration{"a": ms(9)},
+		candidates: []candidate{{tag: "a", member: "a-1"}, {tag: "b", member: "b-1"}},
+		failures: map[string]error{"b": fmt.Errorf("%w: %w: http2 server refused stream",
+			naive.ErrNextHopUnreachable, naive.ErrStreamRefused)},
+	}
+	smart.storeSnapshot("3f2a", M.ParseSocksaddr("example.com:443"),
+		snapshotBasis{replacing: previous, carryFrom: previous}, report, nil, "a")
+
+	updated := smart.cache.load("3f2a")
+	_, found := updated.remoteFor("b")
+	require.True(t, found)
+	require.True(t, updated.carried("b"))
+}
+
+func TestARefreshAProbeThisEndClosedKeepsItsLegs(t *testing.T) {
+	t.Parallel()
+	// A member drops its sessions on a network change, and a refresh racing
+	// at that moment saw its probe aborted from this side. That is no reading
+	// of the group, and dropping its leg left it unselectable here for hours.
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart")}
+	for _, tag := range []string{"a", "b"} {
+		smart.groups = append(smart.groups, &smartGroup{tag: tag, members: []*smartMember{newMember(tag+"-1", ms(30))}})
+	}
+	previous := &destinationEntry{
+		Remote:   map[string]remoteWindow{"a": {ms(9)}, "b": {ms(1)}},
+		Path:     map[string]time.Duration{"a": ms(80), "b": ms(30)},
+		Selected: "a",
+		RacedAt:  time.Now().Add(-time.Hour),
+	}
+	smart.cache.store("3f2a", previous)
+	report := raceReport{
+		winner:     "a",
+		remote:     map[string]time.Duration{"a": ms(9)},
+		candidates: []candidate{{tag: "a", member: "a-1"}, {tag: "b", member: "b-1"}},
+		failures:   map[string]error{"b": fmt.Errorf("%w: %w", naive.ErrNextHopUnreachable, naive.ErrClosedLocally)},
+	}
+	smart.storeSnapshot("3f2a", M.ParseSocksaddr("example.com:443"),
+		snapshotBasis{replacing: previous, carryFrom: previous}, report, nil, "a")
+
+	updated := smart.cache.load("3f2a")
+	_, found := updated.remoteFor("b")
+	require.True(t, found)
+	require.True(t, updated.carried("b"))
+}
+
+func TestAnAnswerOnOnePortDoesNotClearAnotherPortsRefusals(t *testing.T) {
+	t.Parallel()
+	// Reaching the host on 443 says nothing about 25. Clearing 25's run there
+	// reset its doubling on every refresh of a busy host, and each reset cost
+	// a round of dials against a port the exit blocks.
+	smart := &Smart{ctx: context.Background(), logger: logger.NOP(), alpha: testAlpha,
+		cache: newSmartCache(context.Background(), "smart")}
+	now := time.Now()
+	previous := &destinationEntry{RacedAt: now.Add(-time.Hour)}
+	previous.block("us", 25, now, nil)
+	previous.block("us", 25, now, nil)
+	smart.cache.store("3f2a", previous)
+	report := raceReport{
+		winner:     "us",
+		remote:     map[string]time.Duration{"us": ms(20)},
+		candidates: []candidate{{tag: "us", member: "out-us"}},
+	}
+	smart.storeSnapshot("3f2a", M.ParseSocksaddr("mail.example.com:443"),
+		snapshotBasis{replacing: previous, carryFrom: previous}, report, nil, "")
+
+	updated := smart.cache.load("3f2a")
+	updated.block("us", 25, now, nil)
+	require.True(t, updated.blocked("us", 25, nil, now.Add(4*destinationFailureCooldown-time.Second)),
+		"the third refusal on 25 still costs four times the base")
 }
 
 func TestReachingADestinationClearsWhatItsRefusalsEarned(t *testing.T) {
@@ -984,11 +1171,11 @@ func TestReachingADestinationClearsWhatItsRefusalsEarned(t *testing.T) {
 	now := time.Now()
 	previous := &destinationEntry{RacedAt: now.Add(-time.Hour)}
 	for range 4 {
-		previous.block("us", now)
+		previous.block("us", 443, now, nil)
 	}
-	previous.block("jp", now)
+	previous.block("jp", 443, now, nil)
 	smart.cache.store("3f2a", previous)
-	require.True(t, previous.blocked("us", now.Add(4*destinationFailureCooldown)))
+	require.True(t, previous.blocked("us", 443, nil, now.Add(4*destinationFailureCooldown)))
 
 	// us answers the next round; jp stays silent.
 	report := raceReport{
@@ -1000,11 +1187,193 @@ func TestReachingADestinationClearsWhatItsRefusalsEarned(t *testing.T) {
 		snapshotBasis{replacing: previous, carryFrom: previous}, report, nil, "")
 
 	updated := smart.cache.load("3f2a")
-	require.False(t, updated.blocked("us", now), "the group that answered is off cooldown")
-	require.True(t, updated.blocked("jp", now), "the one that did not still owes its own")
+	require.False(t, updated.blocked("us", 443, nil, now), "the group that answered is off cooldown")
+	require.True(t, updated.blocked("jp", 443, nil, now), "the one that did not still owes its own")
 
 	// And the run is gone, not merely the timer: the next refusal starts over.
-	updated.block("us", now)
-	require.False(t, updated.blocked("us", now.Add(destinationFailureCooldown+time.Second)),
+	updated.block("us", 443, now, nil)
+	require.False(t, updated.blocked("us", 443, nil, now.Add(destinationFailureCooldown+time.Second)),
 		"a group that recovered pays the base again, not what it owed before")
+}
+
+func sizedOn(t *testing.T, db *bbolt.DB, size int) *smartCache {
+	t.Helper()
+	cache := newSmartCacheSized(context.Background(), "smart", size)
+	cache.resolve.Do(func() { cache.cacheFile = &cachefile.CacheFile{DB: db} })
+	return cache
+}
+
+func rowCount(t *testing.T, cache *smartCache) int {
+	t.Helper()
+	var rows int
+	require.NoError(t, cache.db().View(func(tx *bbolt.Tx) error {
+		if bucket := cache.ownBucket(tx); bucket != nil {
+			rows = bucket.Stats().KeyN
+		}
+		return nil
+	}))
+	return rows
+}
+
+func TestARowPushedOutOfTheCacheLeavesTheDisk(t *testing.T) {
+	t.Parallel()
+	// The rows used to outlive their entries for the rest of the run, and the
+	// next start read every one of them back only to keep the newest.
+	db, err := bbolt.Open(filepath.Join(t.TempDir(), "cache.db"), 0o600, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	cache := sizedOn(t, db, 8)
+	for i := range 20 {
+		cache.store(fmt.Sprint("dest", i), &destinationEntry{Selected: "a", RacedAt: time.Now()})
+		if i%3 == 0 {
+			require.NoError(t, cache.flush())
+		}
+	}
+	require.NoError(t, cache.flush())
+	require.Equal(t, cache.entries.Len(), rowCount(t, cache))
+
+	// And one pushed out but decided again before the flush keeps its row.
+	cache.store("dest0", &destinationEntry{Selected: "b", RacedAt: time.Now()})
+	require.NoError(t, cache.flush())
+	restarted := sizedOn(t, db, 8)
+	restarted.preload()
+	require.NotNil(t, restarted.load("dest0"))
+}
+
+func TestPreloadDoesNotPushOutADecisionMadeBeforeIt(t *testing.T) {
+	t.Parallel()
+	// A destination raced while the bucket was being read is not on disk yet
+	// and is the oldest entry by the time preload adds to the cache. With the
+	// disk full it was the first thing pushed out: the decision was lost, and
+	// last run's row for it came back on the next start.
+	db, err := bbolt.Open(filepath.Join(t.TempDir(), "cache.db"), 0o600, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	previous := sizedOn(t, db, 8)
+	for i := range 8 {
+		previous.store(fmt.Sprint("old", i), &destinationEntry{Selected: "a", RacedAt: time.Now().Add(-time.Hour)})
+	}
+	require.NoError(t, previous.flush())
+
+	restarted := sizedOn(t, db, 8)
+	restarted.store("fresh", &destinationEntry{Selected: "sg", RacedAt: time.Now()})
+	restarted.preload()
+	require.NotNil(t, restarted.load("fresh"))
+	require.NoError(t, restarted.flush())
+
+	final := sizedOn(t, db, 8)
+	final.preload()
+	require.NotNil(t, final.load("fresh"))
+	require.Equal(t, final.entries.Len(), rowCount(t, final))
+}
+
+func TestAFailedFlushStillDeletesWhatWasPushedOutLater(t *testing.T) {
+	t.Parallel()
+	db, err := bbolt.Open(filepath.Join(t.TempDir(), "cache.db"), 0o600, nil)
+	require.NoError(t, err)
+	cache := sizedOn(t, db, 8)
+	for i := range 12 {
+		cache.store(fmt.Sprint("dest", i), &destinationEntry{Selected: "a", RacedAt: time.Now()})
+	}
+	require.NoError(t, db.Close())
+	require.Error(t, cache.flush())
+	cache.access.Lock()
+	defer cache.access.Unlock()
+	require.Len(t, cache.evicted, 4, "kept for the next flush, as the dirty marks are")
+}
+
+func TestTheCacheFollowsTheFileThroughARecovery(t *testing.T) {
+	t.Parallel()
+	// The cache file resets a corrupt database and swaps the handle under its
+	// own lock. Smart read the handle without it — a race with the swap — and
+	// ran its transactions outside the recovery, so a corrupt file it touched
+	// first took the process down instead of being reset. The race is what
+	// fails without the fix, so this needs -race to mean anything.
+	path := filepath.Join(t.TempDir(), "cache.db")
+	ctx := context.Background()
+	scope := adapter.NewScope(ctx, logger.NOP())
+	file := cachefile.New(ctx, logger.NOP(), option.CacheFileOptions{Path: path})
+	require.NoError(t, file.Start(adapter.StartStateInitialize, scope))
+	t.Cleanup(func() { scope.Close() })
+	cache := newSmartCache(ctx, "out-main")
+	cache.resolve.Do(func() { cache.cacheFile = file })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 50 {
+			cache.store(fmt.Sprint("dest", i), &destinationEntry{Selected: "jp", RacedAt: time.Now()})
+			_ = cache.flush()
+		}
+	}()
+	// What a transaction on a corrupt file looks like from here: a panic,
+	// which the cache file turns into a reset.
+	require.Error(t, file.View(func(*bbolt.Tx) error { panic("simulated corruption") }))
+	<-done
+
+	cache.store("after", &destinationEntry{Selected: "sg", RacedAt: time.Now()})
+	require.NoError(t, cache.flush())
+	restarted := newSmartCache(ctx, "out-main")
+	restarted.resolve.Do(func() { restarted.cacheFile = file })
+	restarted.preload()
+	require.NotNil(t, restarted.load("after"), "written into the database the reset opened")
+}
+
+// A race wrote its result to disk before handing the caller its connection:
+// 11-20ms on every new destination, for a write the periodic flush makes a
+// moment later anyway.
+func TestARaceHandsOverItsConnectionBeforeWritingToDisk(t *testing.T) {
+	t.Parallel()
+	cache := onDisk(t)
+	smart := newWarmFixtureOn(t, cache, map[string]*resolvingOutbound{"a": warmSibling(), "b": warmSibling()})
+	// An address, so there is no lookup for an amendment to flush.
+	destination := M.ParseSocksaddr("203.0.113.7:443")
+	key := destinationKey(destination)
+	stored := func() []byte {
+		var row []byte
+		require.NoError(t, cache.db().View(func(tx *bbolt.Tx) error {
+			if top := tx.Bucket(smartBucket); top != nil {
+				if owner := top.Bucket([]byte("smart")); owner != nil {
+					row = owner.Get([]byte(key))
+				}
+			}
+			return nil
+		}))
+		return row
+	}
+
+	_, _, conn, err := smart.race(context.Background(), key, destination, nil)
+	require.NoError(t, err)
+	if conn != nil {
+		require.NoError(t, conn.Close())
+	}
+	require.NotNil(t, cache.load(key))
+	require.Nil(t, stored(), "nothing was written before the caller had its connection")
+	require.NoError(t, cache.flush())
+	require.NotNil(t, stored(), "the next flush writes it")
+}
+
+func TestACooldownSpeaksOnlyForTheMemberThatEarnedIt(t *testing.T) {
+	t.Parallel()
+	// A refusal is only as good as the exit that gave it. One that lost its
+	// own egress refused everything, and each destination it refused stayed
+	// off the group for five minutes after it came back — or after the group
+	// moved to a sibling that never refused anything.
+	now := time.Now()
+	main := newMember("us-1", ms(30))
+	spare := newMember("us-2", ms(40))
+	entry := &destinationEntry{}
+	entry.block("us", 443, now, main)
+	require.True(t, entry.blocked("us", 443, main, now))
+	require.False(t, entry.blocked("us", 443, spare, now), "the group moved to a member that never refused it")
+
+	main.downAt.Store(now.Add(time.Second).UnixNano())
+	require.False(t, entry.blocked("us", 443, main, now.Add(2*time.Second)),
+		"condemned since, so what it refused then is explained by what condemned it")
+
+	later := now.Add(3 * time.Second)
+	entry.block("us", 443, later, main)
+	require.True(t, entry.blocked("us", 443, main, later), "a refusal after it came back is filed afresh")
+	require.True(t, entry.blocked("us", 443, main, later.Add(2*destinationFailureCooldown-time.Second)),
+		"and still escalates: the run of refusals is untouched")
 }
