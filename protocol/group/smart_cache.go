@@ -613,9 +613,36 @@ type cooldownKey struct {
 // still found every one of them off limits until its cooldown ran out. See
 // applies.
 type cooldown struct {
-	until time.Time
-	by    *smartMember
-	filed int64
+	until   time.Time
+	by      *smartMember
+	filed   int64
+	retried time.Time
+}
+
+// retryRefused admits a single-path recovery check without lifting a route's
+// cooldown. All exits refusing a host is not evidence it will stay down for minutes.
+func (e *destinationEntry) retryRefused(tag string, port uint16, member *smartMember, now time.Time) bool {
+	e.access.Lock()
+	defer e.access.Unlock()
+	key := cooldownKey{tag, port}
+	c, found := e.unreachable[key]
+	if !found || !c.applies(member, now) {
+		return false
+	}
+	delay := time.Second
+	for i := 1; i < e.refusals[key] && delay < 5*time.Second; i++ {
+		delay = min(2*delay, 5*time.Second)
+	}
+	last := time.Unix(0, c.filed)
+	if c.retried.After(last) {
+		last = c.retried
+	}
+	if now.Sub(last) < delay {
+		return false
+	}
+	c.retried = now
+	e.unreachable[key] = c
+	return true
 }
 
 // applies reports whether this cooldown still speaks for the member a group

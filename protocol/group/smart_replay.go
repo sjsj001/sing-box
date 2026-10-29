@@ -57,7 +57,9 @@ type replayConn struct {
 	member      *smartMember
 	// exclude is every group this connection has been dialed on, or nil for a
 	// first dial, which has been dialed on its own group only.
-	exclude map[string]bool
+	exclude       map[string]bool
+	failoverFrom  string
+	failoverCause error
 
 	access  sync.Mutex
 	settled bool
@@ -230,6 +232,7 @@ func (c *replayConn) doSettle() error {
 
 	measured, isMeasured := common.Cast[naive.MeasuredConn](conn)
 	if !isMeasured {
+		c.logFailover()
 		c.finish()
 		return nil
 	}
@@ -256,6 +259,7 @@ func (c *replayConn) doSettle() error {
 	suspicion.Stop()
 	if err == nil {
 		c.smart.record(member, measurement)
+		c.logFailover()
 		if measurement.HasRemote {
 			c.smart.observeScore(c.key, c.destination, c.group, member, measurement)
 		}
@@ -364,6 +368,13 @@ func (c *replayConn) doSettle() error {
 	c.access.Unlock()
 	// The condemned tunnel was closed before it was judged, above.
 	return nil
+}
+
+func (c *replayConn) logFailover() {
+	if c.failoverFrom != "" {
+		c.smart.logger.Info("failed over ", c.destination, " from ", c.failoverFrom, " to ", c.group.tag,
+			" by=", reasonFailover, ": ", c.failoverCause)
+	}
 }
 
 // finish marks the connection settled without a swap.

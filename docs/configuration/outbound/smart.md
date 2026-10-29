@@ -66,9 +66,9 @@ What that changes for the caller:
   destination whose proxy refuses it. A relay whose outbound is smart still
   answers the CONNECT only after the race, with the winner's answer, or 502 when
   every group refused and 503 otherwise.
-- A dial is still refused at once when no group is left to race — every group
-  that is up is cooling down on this port — and when its context is already
-  cancelled. After that the dial's context no longer ends the race; closing the
+- A dial is refused at once when its context is already cancelled, or when all
+  healthy groups are cooling down and a recovery check is not due or cannot
+  take a probe slot. After that the dial's context no longer ends the race; closing the
   connection does.
 
 What it changes for the destination: a round used to show it one bare connection
@@ -83,17 +83,23 @@ ClientHello to the first few groups only would keep the saving where it is
 smallest, a near group winning, and lose it where it is largest, so there is no
 option for it.
 
-A destination that every group answered "cannot reach it" (502) for is refused
-outright on its next connections, without dialing any group. The refusal is
-remembered **per group and per port** — a host serving only 443 refuses 80, and
+A refusal is remembered **per group and per port** — a host serving only 443 refuses 80, and
 a provider that blocks 25 still carries 465 — for five minutes the first time,
 doubling on each further refusal of the same port up to an hour. The refusal
 also remembers **which member** gave it, and stops counting once the group uses
 a different member, or once that member has been condemned since: an exit that
 lost its own egress answers 502 for everything, and those refusals were about
-the exit, not the destination. Otherwise nothing shortens it: a port that has
-come back is dialed again only when its cooldown runs out, and the count resets
-once the group reaches that port again.
+the exit, not the destination. The count resets once the group reaches that port again.
+
+When every healthy group refuses the same port, later requests can check it
+through the original group after one second. Repeated failures increase this
+delay to two, four, then at most five seconds. Only one recovery check per host
+and port can run at once, within the shared probe limit. It does not tour the
+other groups or change the host's selected group. A successful CONNECT clears
+that group's refusal and count on this port. A failed recovery also checks the
+member's real egress, at most once per member per thirty seconds, using the
+independent reachability addresses. A target failure alone does not condemn a
+member. A failover is logged only after the replacement confirms the CONNECT.
 
 A connection to a decided destination goes out at once with its opening write.
 If the proxy then fails before answering the CONNECT, the connection moves to

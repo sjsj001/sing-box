@@ -297,6 +297,8 @@ type Smart struct {
 	// page load opening eight connections at once produces one round and seven
 	// waiters rather than eight rounds. See Smart.raceOrWait.
 	races sync.Map
+	// recoveries holds only active, single-path checks of a refused host/port.
+	recoveries sync.Map
 	// raceIgnoresDeadline and raceGrace are set only by tests, whose outbounds
 	// claim milliseconds they do not take: on a loaded machine the scheduler
 	// can deliver an answer later than a deadline or grace derived from those
@@ -1004,9 +1006,15 @@ func (s *Smart) dialTCP(ctx context.Context, destination M.Socksaddr) (net.Conn,
 	}
 	entry := s.cache.load(key)
 	now := time.Now()
+	var candidates []candidate
+	if entry != nil {
+		candidates = s.candidates(entry, destination.Port, now)
+		if len(candidates) == 0 {
+			return s.recoverDestination(ctx, key, destination, entry)
+		}
+	}
 
 	if entry != nil && entry.measured() {
-		candidates := s.candidates(entry, destination.Port, now)
 		if entry.expired(key, now) {
 			// Refresh in the background: the stale answer is still a real
 			// measurement, and making the user wait for a new one buys nothing.
@@ -1165,16 +1173,16 @@ func (s *Smart) replayOnAnotherGroup(ctx context.Context, destination M.Socksadd
 			continue
 		}
 		s.countRequest(key, group, member, reasonFailover, N.NetworkTCP)
-		s.logger.InfoContext(ctx, "failed over ", destination, " from ", from, " to ", selected,
-			" by=", reasonFailover, ": ", lastError)
 		return &replayConn{
-			Conn:        conn,
-			smart:       s,
-			destination: destination,
-			key:         key,
-			group:       group,
-			member:      member,
-			exclude:     excluded,
+			Conn:          conn,
+			smart:         s,
+			destination:   destination,
+			key:           key,
+			group:         group,
+			member:        member,
+			exclude:       excluded,
+			failoverFrom:  from,
+			failoverCause: lastError,
 		}, nil
 	}
 }

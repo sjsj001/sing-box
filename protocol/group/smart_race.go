@@ -817,7 +817,7 @@ func (s *Smart) dialWithoutRacing(ctx context.Context, key string, destination M
 	now := time.Now()
 	candidates := s.candidates(entry, destination.Port, now)
 	if len(candidates) == 0 {
-		return nil, s.errNoCandidate(entry, destination, now)
+		return s.recoverDestination(ctx, key, destination, entry)
 	}
 	selected, reason := s.chooseGroup(candidates, incumbentOf(entry))
 	return s.dialWithFailover(ctx, destination, key, selected, reason)

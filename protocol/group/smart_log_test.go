@@ -134,6 +134,8 @@ func TestAFailoverSaysWhereItCameFromAndWhy(t *testing.T) {
 	conn, err := s.dialTCP(context.Background(), destination)
 	require.NoError(t, err)
 	defer conn.Close()
+	require.Empty(t, lines.matching("failed over"), "opening a tunnel does not confirm the target answered")
+	require.NoError(t, conn.(*replayConn).settle())
 	// hk refused, jp was tried next and refused too: the line names the last
 	// group left, not the first, and carries its answer.
 	require.Equal(t, []string{"failed over example.com:443 from jp to sg by=failover: " + refused.Error()},
