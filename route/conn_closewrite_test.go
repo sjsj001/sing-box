@@ -51,7 +51,7 @@ func (d *fixedDialer) DialContext(context.Context, string, M.Socksaddr) (net.Con
 // and was logged as an error.
 func TestAClientEndingAConnectionBehindAGroupIsNotAnError(t *testing.T) {
 	logger := &errorRecorder{ContextLogger: log.NewNOPFactory().Logger()}
-	manager := NewConnectionManager(logger)
+	manager := NewConnectionManager(context.Background(), logger)
 	remote, far := net.Pipe()
 	defer far.Close()
 	go func() {

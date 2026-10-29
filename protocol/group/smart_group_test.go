@@ -326,16 +326,16 @@ func TestAmbiguousGroupingIsRejected(t *testing.T) {
 	require.ErrorContains(t, err, "is in both group")
 }
 
-func TestNowNamesSomethingAllAlsoNames(t *testing.T) {
+func TestSelectedNamesSomethingAllAlsoNames(t *testing.T) {
 	t.Parallel()
-	// A dashboard marks the entry in All that equals Now. A Now of
-	// "group/member" matches nothing, and the panel shows no selection at all.
+	// The dashboard selection must name a configured member.
 	member := newMember("hk-1", ms(29))
+	member.outbound = &preMatchTestOutbound{tag: "hk-1"}
 	smart := &Smart{
 		alpha:  testAlpha,
 		groups: []*smartGroup{{tag: "hk", members: []*smartMember{member}}},
 	}
-	require.Contains(t, smart.All(), smart.Now())
+	require.Contains(t, smart.All(), smart.Selected(N.NetworkTCP).Tag())
 }
 
 func TestAStarvedHandshakeDoesNotMakeANodeLookFurtherAway(t *testing.T) {

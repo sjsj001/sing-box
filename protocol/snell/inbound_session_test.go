@@ -175,7 +175,7 @@ func TestAUoTSessionThatRouteEndsClosesItsConnection(t *testing.T) {
 	require.Equal(t, 10*time.Second, C.ProtocolTimeouts[C.ProtocolDNS])
 	inbound := newV5InboundForHandshake(t)
 	inbound.handshakeTimeout = 5 * time.Second
-	inbound.router = &routeUDPRouter{manager: route.NewConnectionManager(log.NewNOPFactory().NewLogger("route")), udpTimeout: 200 * time.Millisecond}
+	inbound.router = &routeUDPRouter{manager: route.NewConnectionManager(context.Background(), log.NewNOPFactory().NewLogger("route")), udpTimeout: 200 * time.Millisecond}
 	addr := serveSnell(t, inbound)
 	echo, received := startUDPEcho(t)
 	client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte("test-password")})

@@ -10,9 +10,8 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/interrupt"
-
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/sniff"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -204,6 +203,9 @@ func isPassOutbound(manager adapter.OutboundManager, tag string) bool {
 func resolveOutbound(outbound adapter.Outbound, network string, metadata *adapter.InboundContext) ([]adapter.Outbound, error) {
 	chain := []adapter.Outbound{outbound}
 	for {
+		if handlesConnection(outbound, network) {
+			break
+		}
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			break
@@ -224,6 +226,16 @@ func resolveOutbound(outbound adapter.Outbound, network string, metadata *adapte
 		return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", outbound.Tag())
 	}
 	return chain, nil
+}
+
+// A handler group owns dialing and replay; Selected only describes its default.
+func handlesConnection(outbound adapter.Outbound, network string) bool {
+	if network == N.NetworkTCP {
+		_, ok := outbound.(adapter.ConnectionHandler)
+		return ok
+	}
+	_, ok := outbound.(adapter.PacketConnectionHandler)
+	return ok
 }
 
 func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
@@ -649,6 +661,9 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 
 func (r *Router) selectPreMatchOutbound(metadata *adapter.InboundContext, outbound adapter.Outbound, depth int) ([]adapter.Outbound, adapter.PreMatchAction) {
 	if outbound == nil || depth > 8 {
+		return nil, adapter.PreMatchContinue
+	}
+	if handlesConnection(outbound, metadata.Network) {
 		return nil, adapter.PreMatchContinue
 	}
 	if preMatchGroup, isPreMatchGroup := outbound.(adapter.PreMatchOutboundGroup); isPreMatchGroup {

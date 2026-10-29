@@ -50,7 +50,7 @@ func (udpListenDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketCon
 
 func TestAUDPSessionWithoutReadDeadlinesEndsAtItsTimeout(t *testing.T) {
 	t.Parallel()
-	manager := NewConnectionManager(log.NewNOPFactory().NewLogger("route"))
+	manager := NewConnectionManager(context.Background(), log.NewNOPFactory().NewLogger("route"))
 	conn := &noDeadlinePacketConn{closed: make(chan struct{})}
 	ended := make(chan error, 1)
 	manager.NewPacketConnection(context.Background(), udpListenDialer{}, conn, adapter.InboundContext{

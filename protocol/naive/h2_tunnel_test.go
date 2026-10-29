@@ -127,7 +127,7 @@ func TestAnIdleTunnelUploadWaitsOnASmallBuffer(t *testing.T) {
 				received <- data
 			}()
 			inbound, _ := fallbackInbound(t)
-			inbound.router = tunnelRouter{manager: route.NewConnectionManager(log.NewNOPFactory().Logger()), remote: remote}
+			inbound.router = tunnelRouter{manager: route.NewConnectionManager(context.Background(), log.NewNOPFactory().Logger()), remote: remote}
 			inbound.listener = listener.New(listener.Options{}) // only for its options; never started
 			header := http.Header{}
 			header.Set("Padding", "x")

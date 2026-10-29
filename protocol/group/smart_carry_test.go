@@ -535,7 +535,7 @@ func (r relayRouter) RouteConnectionEx(ctx context.Context, conn net.Conn, metad
 // serveRelay puts a naive inbound in front of outbound, on h2 without TLS.
 func serveRelay(t *testing.T, outbound N.Dialer) string {
 	t.Helper()
-	router := relayRouter{manager: route.NewConnectionManager(logger.NOP()), outbound: outbound}
+	router := relayRouter{manager: route.NewConnectionManager(context.Background(), logger.NOP()), outbound: outbound}
 	inbound, err := naive.NewInbound(context.Background(), router, logger.NOP(), "relay", option.NaiveInboundOptions{
 		Users:   []auth.User{{Username: "user", Password: "secret"}},
 		Network: option.NetworkList(N.NetworkTCP),

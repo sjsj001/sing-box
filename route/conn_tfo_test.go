@@ -28,7 +28,7 @@ type fastOpenDialer struct {
 func (d *fastOpenDialer) DialContext(ctx context.Context, network string, _ M.Socksaddr) (net.Conn, error) {
 	// Fallback, so a platform without fast open still dials as production
 	// would there: the half-close test's write is the first, which fast opens.
-	conn, err := dialer.DialSlowContext(&tfo.Dialer{Fallback: true}, ctx, network, d.target)
+	conn, err := dialer.DialSlowContext(&tfo.Dialer{Fallback: true}, ctx, "", network, d.target)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +61,7 @@ func greetingServer(t *testing.T) M.Socksaddr {
 // the deprecated interface that said it, and a client waiting for a greeting
 // waited on a connection never made.
 func TestAServerFirstProtocolIsGreetedOverFastOpen(t *testing.T) {
-	manager := NewConnectionManager(log.NewNOPFactory().Logger())
+	manager := NewConnectionManager(context.Background(), log.NewNOPFactory().Logger())
 	client, inbound := net.Pipe()
 	defer client.Close()
 	var metadata adapter.InboundContext
@@ -76,7 +76,7 @@ func TestAServerFirstProtocolIsGreetedOverFastOpen(t *testing.T) {
 }
 
 func TestAFastOpenConnectionHalfClosesThroughTheTracker(t *testing.T) {
-	manager := NewConnectionManager(log.NewNOPFactory().Logger())
+	manager := NewConnectionManager(context.Background(), log.NewNOPFactory().Logger())
 	conn, err := (&fastOpenDialer{target: greetingServer(t), manager: manager}).DialContext(context.Background(), N.NetworkTCP, M.Socksaddr{})
 	require.NoError(t, err)
 	defer conn.Close()
@@ -121,7 +121,7 @@ func answerAfterEOFServer(t *testing.T) M.Socksaddr {
 // open connection still gets the answer, so the half-close reached the dialed
 // connection beneath the tracker rather than closing it outright.
 func TestAClientHalfCloseOverFastOpenKeepsTheAnswer(t *testing.T) {
-	manager := NewConnectionManager(log.NewNOPFactory().Logger())
+	manager := NewConnectionManager(context.Background(), log.NewNOPFactory().Logger())
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer listener.Close()

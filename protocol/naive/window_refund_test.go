@@ -200,7 +200,7 @@ func TestResetStreamRefundsConnectionWindow(t *testing.T) {
 		// so with the destination stuck nothing but the inbound closing the
 		// body on the reset gives the upload back.
 		t.Run("destination never reads", func(t *testing.T) {
-			window := resetTunnelsGiveBack(t, path, stallRouter{t: t, manager: route.NewConnectionManager(log.NewNOPFactory().Logger())}, nil)
+			window := resetTunnelsGiveBack(t, path, stallRouter{t: t, manager: route.NewConnectionManager(context.Background(), log.NewNOPFactory().Logger())}, nil)
 			require.EqualValues(t, budget, window, "the reset tunnels' upload came back more than once")
 		})
 	})

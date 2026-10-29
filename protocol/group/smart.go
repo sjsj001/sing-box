@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"slices"
 	"sync"
@@ -508,16 +509,26 @@ func (s *Smart) Close() error {
 	return s.audit.Close()
 }
 
-// Now names the outbound currently in use, and All names every outbound that
-// could be. They have to be drawn from the same set: a dashboard marks the entry
-// in All that equals Now, so a Now built as "group/member" matches nothing and
-// the panel shows a group with no selection at all.
-func (s *Smart) Now() string {
+// Selected is the dashboard's default choice. Connections still go through
+// Smart's handlers, which choose and recover a route for each destination.
+func (s *Smart) Selected(network string) adapter.Outbound {
+	if network == N.NetworkUDP {
+		selected, _ := s.chooseGroup(s.usableCandidates(nil, 0, time.Now(), network), "")
+		if group := s.group(selected); group != nil {
+			return group.current().outbound
+		}
+		return nil
+	}
 	_, member := s.best()
 	if member == nil {
-		return ""
+		return nil
 	}
-	return member.tag
+	return member.outbound
+}
+
+func (s *Smart) AttachConnection(io.Closer) func() {
+	// TCP survives selection changes; UDP is interrupted per member by udp.
+	return func() {}
 }
 
 func (s *Smart) All() []string {
